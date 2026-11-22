@@ -1031,23 +1031,6 @@ function main() {
     process.exit(2);
   }
 
-  // Validate paths safety before doing anything
-  for (const edit of edits) {
-    const p = edit.path;
-    if (!isSafePath(p)) {
-      process.stdout.write(`error: unsafe ${p}\n`);
-      process.exit(1);
-    }
-    if (edit.oldPath && !isSafePath(edit.oldPath)) {
-      process.stdout.write(`error: unsafe ${edit.oldPath}\n`);
-      process.exit(1);
-    }
-    if (edit.newPath && !isSafePath(edit.newPath)) {
-      process.stdout.write(`error: unsafe ${edit.newPath}\n`);
-      process.exit(1);
-    }
-  }
-
   // Simulate or prepare file states
   // We need virtual file system state or working on actual files.
   // Since mend operates on the working directory, let's load files as needed or simulate.
@@ -1092,6 +1075,10 @@ function main() {
   }
 
   for (const edit of edits) {
+    if (!isSafePath(edit.path) || (edit.oldPath && !isSafePath(edit.oldPath)) || (edit.newPath && !isSafePath(edit.newPath))) {
+      errorLines.push(`error: unsafe ${edit.path}`);
+      continue;
+    }
     if (edit.type === 'create') {
       const v = getVirtualFile(edit.path);
       if (v.exists) {
