@@ -172,103 +172,116 @@ function parseUnifiedDiff(text: string): ParseResult {
   const lines = text.split(/\r?\n/);
   const edits: EditOperation[] = [];
   let i = 0;
-  let currentFile: string | null = null;
-  let currentHunks: any[] = [];
+
+  type Section = {
+    oldPath: string | null;
+    newPath: string | null;
+    isCreate: boolean;
+    isDelete: boolean;
+    hunks: any[];
+  };
+  let currentSection: Section | null = null;
   let curHunk: any = null;
+
+  function finishHunk() {
+    if (curHunk && currentSection) {
+      currentSection.hunks.push(curHunk);
+      curHunk = null;
+    }
+  }
+
+  function finishSection() {
+    if (currentSection) {
+      finishHunk();
+      const { oldPath, newPath, isCreate, isDelete, hunks } = currentSection;
+      if (isCreate) {
+        if (newPath) {
+          let fileText = '';
+          for (const hunk of hunks) {
+            for (const line of hunk.lines) {
+              if (line.type === '+') fileText += line.text + '\n';
+            }
+          }
+          edits.push({ type: 'create', path: newPath, fileText });
+        }
+      } else if (isDelete) {
+        if (oldPath) edits.push({ type: 'delete', path: oldPath });
+      } else if (oldPath && newPath && oldPath !== newPath) {
+        edits.push({ type: 'move', path: newPath, oldPath, newPath, hunks: hunks.length ? hunks : undefined });
+      } else if (oldPath) {
+        edits.push({ type: 'update', path: oldPath, hunks });
+      }
+      currentSection = null;
+    }
+  }
 
   while (i < lines.length) {
     const line = lines[i];
-    if (line === '' || line.startsWith('#')) {
+    if (line.startsWith('diff --git ')) {
+      finishSection();
+      const m = line.match(/^diff --git a\/(.*) b\/(.*)$/);
+      if (!m) return { edits: [], error: { code: 'parse', line: i + 1 } };
+      currentSection = { oldPath: m[1], newPath: m[2], isCreate: false, isDelete: false, hunks: [] };
       i++;
       continue;
     }
     if (line.startsWith('--- ')) {
-      if (curHunk) {
-        currentHunks.push(curHunk);
-        curHunk = null;
-      }
-      if (currentFile && currentHunks.length > 0) {
-        edits.push({ type: 'update', path: currentFile, hunks: currentHunks });
-        currentHunks = [];
-      }
-      // parse target file path
-      const pathPart = line.slice(4).trim();
-      // remove timestamp or tab
-      const cleanPath = pathPart.split('\t')[0].trim();
-      let targetPath = cleanPath;
-      if (cleanPath.startsWith('a/') || cleanPath.startsWith('b/')) {
-        targetPath = cleanPath.slice(2);
-      }
-      currentFile = targetPath;
-      i++;
-      if (i < lines.length && lines[i].startsWith('+++ ')) {
-        const plusPart = lines[i].slice(4).trim();
-        const cleanPlus = plusPart.split('\t')[0].trim();
-        if (!cleanPlus.startsWith('/dev/null') && cleanPlus !== '/dev/null') {
-          let p2 = cleanPlus;
-          if (p2.startsWith('a/') || p2.startsWith('b/')) p2 = p2.slice(2);
-          if (p2 !== '' && p2 !== '/dev/null') currentFile = p2;
+      if (i + 1 < lines.length && lines[i+1].startsWith('+++ ')) {
+        const oldP = line.slice(4).split('\t')[0].trim().replace(/^(a|b)\//, '');
+        const newP = lines[i+1].slice(4).split('\t')[0].trim().replace(/^(a|b)\//, '');
+        if (currentSection && currentSection.hunks.length === 0 && curHunk === null) {
+            currentSection.oldPath = oldP === '/dev/null' ? null : oldP;
+            currentSection.newPath = newP === '/dev/null' ? null : newP;
+            currentSection.isCreate = oldP === '/dev/null';
+            currentSection.isDelete = newP === '/dev/null';
+        } else {
+            finishSection();
+            currentSection = {
+              oldPath: oldP === '/dev/null' ? null : oldP,
+              newPath: newP === '/dev/null' ? null : newP,
+              isCreate: oldP === '/dev/null',
+              isDelete: newP === '/dev/null',
+              hunks: []
+            };
         }
-        i++;
-      }
-      continue;
-    }
-
-    if (line.startsWith('@@ ')) {
-      if (curHunk) {
-        currentHunks.push(curHunk);
-      }
-      // parse hunk header @@ -l,s +l,s @@
-      const m = line.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@(.*)$/);
-      if (!m) {
-        return { edits: [], error: { code: 'parse', line: i + 1 } };
-      }
-      curHunk = {
-        oldStart: parseInt(m[1], 10),
-        newStart: parseInt(m[2], 10),
-        lines: []
-      };
-      i++;
-      continue;
-    }
-
-    if (curHunk) {
-      if (line.startsWith(' ') || line.startsWith('+') || line.startsWith('-')) {
-        curHunk.lines.push({
-          type: line[0],
-          text: line.slice(1)
-        });
-        i++;
+        i += 2;
         continue;
       } else {
-        // blank or invalid line in hunk
-        if (line.trim() === '') {
-          curHunk.lines.push({ type: ' ', text: '' });
-          i++;
-          continue;
-        }
-        // If it starts with diff headers or something else, close hunk
-        currentHunks.push(curHunk);
-        curHunk = null;
+        if (curHunk) { finishHunk(); }
+        // If not followed by +++, just ignore it (or let loop continue)
+        i++;
         continue;
       }
     }
+    if (line.startsWith('new file mode')) { if(currentSection) currentSection.isCreate = true; i++; continue; }
+    if (line.startsWith('deleted file mode')) { if(currentSection) currentSection.isDelete = true; i++; continue; }
+    if (line.startsWith('rename from ')) { if(currentSection) currentSection.oldPath = line.slice(12).trim(); i++; continue; }
+    if (line.startsWith('rename to ')) { if(currentSection) currentSection.newPath = line.slice(10).trim(); i++; continue; }
 
-    // If we see lines outside hunks that aren't file headers, parse error or skip
+    if (line.startsWith('@@ ')) {
+      if (!currentSection) return { edits: [], error: { code: 'parse', line: i + 1 } };
+      finishHunk();
+      const m = line.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@(.*)$/);
+      if (!m) return { edits: [], error: { code: 'parse', line: i + 1 } };
+      curHunk = { oldStart: parseInt(m[1], 10), newStart: parseInt(m[2], 10), lines: [], noNewlineAtEndOfFile: false };
+      i++;
+      continue;
+    }
+    if (curHunk && (line.startsWith(' ') || line.startsWith('+') || line.startsWith('-') || line === '' || line.startsWith('\\\\'))) {
+        if (line.startsWith('\\\\')) {
+            curHunk.noNewlineAtEndOfFile = true;
+        } else {
+            curHunk.lines.push({ type: line[0], text: line.slice(1) });
+        }
+        i++;
+        continue;
+    }
+    // Hunk end if not starting with space/+/-, etc
+    if (curHunk) { finishHunk(); }
+
     i++;
   }
-
-  if (curHunk) {
-    currentHunks.push(curHunk);
-  }
-  if (currentFile && currentHunks.length > 0) {
-    edits.push({ type: 'update', path: currentFile, hunks: currentHunks });
-  }
-
-  if (edits.length === 0) {
-    return { edits: [], error: { code: 'parse', line: 1 } };
-  }
-
+  finishSection();
   return { edits };
 }
 
@@ -1105,6 +1118,15 @@ function main() {
       if (vNew.exists) {
         errorLines.push(`error: exists ${newP}`);
         continue;
+      }
+      if (edit.hunks) {
+        if (!vOld.lines && vOld.raw !== undefined) vOld.lines = parseFileContent(vOld.raw);
+        const res = applyUnifiedHunks(vOld.lines || { lines: [], crlf: false, hasEndingNewline: false }, edit.hunks, true);
+        if (!res.success) {
+          errorLines.push('error: ' + (res.error?.code || 'no-match') + ' ' + oldP);
+          continue;
+        }
+        vOld = { exists: true, lines: { lines: res.lines!, crlf: vOld.lines?.crlf ?? false, hasEndingNewline: vOld.lines?.hasEndingNewline ?? true } };
       }
       virtualFiles.set(oldP, { exists: false });
       virtualFiles.set(newP, vOld);
