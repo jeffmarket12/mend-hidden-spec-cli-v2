@@ -167,245 +167,299 @@ function detectFormat(patchText: string): string {
 }
 
 function parseUnified(patchText: string): { ops: EditOp[]; error?: { line: number } } {
-  const lines = patchText.split('\n').map(l => l.replace(/\r$/, ''));
-  const ops: EditOp[] = [];
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    let isDiffGit = line.startsWith('diff --git ');
-    let isHeaderPair = line.startsWith('--- ') && i + 1 < lines.length && lines[i+1].startsWith('+++ ');
-    if (!isDiffGit && !isHeaderPair) { i++; continue; }
-    
-    let oldPath = '', newPath = '', isCreation = false, isDeletion = false;
-    if (isDiffGit) {
-      const parts = line.slice(11).trim().split(/\s+/);
-      if (parts.length >= 2) { oldPath = parts[0]; newPath = parts[1]; }
-      i++;
+  const sourceLines = patchText.split('\n').map(l => l.replace(/\r$/, ''));
+  const collectedOps: EditOp[] = [];
+  let cursor = 0;
+  while (cursor < sourceLines.length) {
+    const activeLine = sourceLines[cursor];
+    const isGitPatch = activeLine.startsWith('diff --git ');
+    const isPairHeader = activeLine.startsWith('--- ') && cursor + 1 < sourceLines.length && sourceLines[cursor + 1].startsWith('+++ ');
+    if (!isGitPatch && !isPairHeader) { cursor++; continue; }
+
+    let origPath = '', destPath = '', isNewFile = false, isDelFile = false;
+    if (isGitPatch) {
+      const segs = activeLine.slice(11).trim().split(/\s+/);
+      if (segs.length >= 2) { origPath = segs[0]; destPath = segs[1]; }
+      cursor++;
     } else {
-      // Bare ---/+++ header pair (no diff --git line): parse the paths here.
-      oldPath = line.slice(4).trim().split('\t')[0];
-      newPath = lines[i + 1].slice(4).trim().split('\t')[0];
-      i += 2;
+      origPath = sourceLines[cursor].slice(4).trim().split('\t')[0];
+      destPath = sourceLines[cursor + 1].slice(4).trim().split('\t')[0];
+      cursor += 2;
     }
-    
-    while (i < lines.length) {
-      const cur = lines[i];
-      if (cur.startsWith('@@ ') || cur.startsWith('diff --git ')) break;
-      if (cur.startsWith('--- ')) {
-        if (i + 1 >= lines.length || !lines[i+1].startsWith('+++ ')) return { ops: [], error: { line: i + 2 } };
-        oldPath = cur.slice(4).trim().split('\t')[0];
-        newPath = lines[i+1].slice(4).trim().split('\t')[0];
-        i += 2; continue;
+
+    while (cursor < sourceLines.length) {
+      const row = sourceLines[cursor];
+      if (row.startsWith('@@ ') || row.startsWith('diff --git ')) break;
+      if (row.startsWith('--- ')) {
+        if (cursor + 1 >= sourceLines.length || !sourceLines[cursor + 1].startsWith('+++ ')) return { ops: [], error: { line: cursor + 2 } };
+        origPath = row.slice(4).trim().split('\t')[0];
+        destPath = sourceLines[cursor + 1].slice(4).trim().split('\t')[0];
+        cursor += 2;
+        continue;
       }
-      if (cur.startsWith('+++ ')) { i++; continue; }
-      if (cur.startsWith('rename from ')) { oldPath = cur.slice(12).trim(); i++; continue; }
-      if (cur.startsWith('rename to ')) { newPath = cur.slice(10).trim(); i++; continue; }
-      if (cur === 'new file mode') { isCreation = true; i++; continue; }
-      if (cur === 'deleted file mode') { isDeletion = true; i++; continue; }
-      i++;
+      if (row.startsWith('+++ ')) { cursor++; continue; }
+      if (row.startsWith('rename from ')) { origPath = row.slice(12).trim(); cursor++; continue; }
+      if (row.startsWith('rename to ')) { destPath = row.slice(10).trim(); cursor++; continue; }
+      if (row === 'new file mode') { isNewFile = true; cursor++; continue; }
+      if (row === 'deleted file mode') { isDelFile = true; cursor++; continue; }
+      cursor++;
     }
-    
-    const cleanPath = (p: string) => { if (!p || p === '/dev/null') return p; return (p.startsWith('a/') || p.startsWith('b/')) ? p.slice(2) : p; };
-    let opOld = cleanPath(oldPath), opNew = cleanPath(newPath);
-    if (opOld === '/dev/null') isCreation = true;
-    if (opNew === '/dev/null') isDeletion = true;
-    let targetPath = opOld !== '/dev/null' ? opOld : opNew;
-    let finalNewPath = (opOld !== opNew && opOld !== '/dev/null' && opNew !== '/dev/null') ? opNew : undefined;
-    if (isCreation && opOld === '/dev/null') targetPath = opNew;
-    if (isDeletion && opNew === '/dev/null') targetPath = opOld;
-    if (!targetPath || targetPath === '/dev/null') { i++; continue; }
-    
-    const hunks: { o: string[]; n: string[]; hasEol: boolean; a: number; body?: { type: string; text: string }[] }[] = [];
-    while (i < lines.length) {
-      if (lines[i].startsWith('diff --git ') || (lines[i].startsWith('--- ') && i + 1 < lines.length && lines[i+1].startsWith('+++ '))) break;
-      if (lines[i].startsWith('@@')) {
-        const m = lines[i].match(/@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/);
-        if (!m) return { ops: [], error: { line: i + 1 } };
-        const aVal = parseInt(m[1], 10);
-        i++;
-        const hunkBody: { type: string; text: string }[] = [];
-        while (i < lines.length) {
-          const hLine = lines[i];
-          if (hLine.startsWith('@@ ') || hLine.startsWith('diff --git ') || (hLine.startsWith('--- ') && i + 1 < lines.length && lines[i+1].startsWith('+++ '))) break;
-          if (hLine === '\\ No newline at end of file') { hunkBody.push({ type: '\\', text: '' }); i++; continue; }
-          if (hLine.length === 0 || hLine[0] === ' ' || hLine[0] === '-' || hLine[0] === '+') {
-            const type = hLine.length === 0 ? ' ' : hLine[0];
-            const text = hLine.length === 0 ? '' : hLine.slice(1);
-            hunkBody.push({ type, text });
-            i++; continue;
+
+    const sanitizePath = (p: string) => { if (!p || p === '/dev/null') return p; return (p.startsWith('a/') || p.startsWith('b/')) ? p.slice(2) : p; };
+    let cleanOrig = sanitizePath(origPath), cleanDest = sanitizePath(destPath);
+    if (cleanOrig === '/dev/null') isNewFile = true;
+    if (cleanDest === '/dev/null') isDelFile = true;
+    let finalTarget = cleanOrig !== '/dev/null' ? cleanOrig : cleanDest;
+    let finalRename = (cleanOrig !== cleanDest && cleanOrig !== '/dev/null' && cleanDest !== '/dev/null') ? cleanDest : undefined;
+    if (isNewFile && cleanOrig === '/dev/null') finalTarget = cleanDest;
+    if (isDelFile && cleanDest === '/dev/null') finalTarget = cleanOrig;
+    if (!finalTarget || finalTarget === '/dev/null') { cursor++; continue; }
+
+    const parsedHunks: { o: string[]; n: string[]; hasEol: boolean; a: number; body?: { type: string; text: string }[] }[] = [];
+    while (cursor < sourceLines.length) {
+      if (sourceLines[cursor].startsWith('diff --git ') || (sourceLines[cursor].startsWith('--- ') && cursor + 1 < sourceLines.length && sourceLines[cursor + 1].startsWith('+++ '))) break;
+      if (sourceLines[cursor].startsWith('@@')) {
+        const hunkMatch = sourceLines[cursor].match(/@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@/);
+        if (!hunkMatch) return { ops: [], error: { line: cursor + 1 } };
+        const anchorA = parseInt(hunkMatch[1], 10);
+        cursor++;
+        const contentRows: { type: string; text: string }[] = [];
+        while (cursor < sourceLines.length) {
+          const contentLine = sourceLines[cursor];
+          if (contentLine.startsWith('@@ ') || contentLine.startsWith('diff --git ') || (contentLine.startsWith('--- ') && cursor + 1 < sourceLines.length && sourceLines[cursor + 1].startsWith('+++ '))) break;
+          if (contentLine === '\\ No newline at end of file') { contentRows.push({ type: '\\', text: '' }); cursor++; continue; }
+          if (contentLine.length === 0 || contentLine[0] === ' ' || contentLine[0] === '-' || contentLine[0] === '+') {
+            const t = contentLine.length === 0 ? ' ' : contentLine[0];
+            const txt = contentLine.length === 0 ? '' : contentLine.slice(1);
+            contentRows.push({ type: t, text: txt });
+            cursor++;
+            continue;
           }
           break;
         }
-        while (hunkBody.length > 0 && hunkBody[hunkBody.length - 1].type === ' ' && hunkBody[hunkBody.length - 1].text === '') hunkBody.pop();
-        let oLines: string[] = [], nLines: string[] = [], hasEol = true;
-        for (let bi = 0; bi < hunkBody.length; bi++) {
-          const hb = hunkBody[bi];
-          if (hb.type === ' ') { oLines.push(hb.text); nLines.push(hb.text); }
-          else if (hb.type === '-') { oLines.push(hb.text); }
-          else if (hb.type === '+') { nLines.push(hb.text); }
-          else if (hb.type === '\\') { if (bi > 0) hasEol = false; }
+        while (contentRows.length > 0 && contentRows[contentRows.length - 1].type === ' ' && contentRows[contentRows.length - 1].text === '') contentRows.pop();
+        let extractedOld: string[] = [], extractedNew: string[] = [], eolState = true;
+        for (let idx = 0; idx < contentRows.length; idx++) {
+          const item = contentRows[idx];
+          if (item.type === ' ') { extractedOld.push(item.text); extractedNew.push(item.text); }
+          else if (item.type === '-') { extractedOld.push(item.text); }
+          else if (item.type === '+') { extractedNew.push(item.text); }
+          else if (item.type === '\\') { if (idx > 0) eolState = false; }
         }
-        hunks.push({ o: oLines, n: nLines, hasEol, a: aVal, body: hunkBody });
+        parsedHunks.push({ o: extractedOld, n: extractedNew, hasEol: eolState, a: anchorA, body: contentRows });
         continue;
       }
-      i++;
+      cursor++;
     }
-    ops.push({ type: isCreation ? 'create' : isDeletion ? 'delete' : finalNewPath ? 'rename' : 'update', path: targetPath, newPath: finalNewPath, hunks });
+    collectedOps.push({ type: isNewFile ? 'create' : isDelFile ? 'delete' : finalRename ? 'rename' : 'update', path: finalTarget, newPath: finalRename, hunks: parsedHunks });
   }
-  return { ops };
+  return { ops: collectedOps };
 }
 
 function parseSearchReplace(patchText: string): { ops: EditOp[]; error?: { line: number } } {
-  const lines = patchText.split('\n').map(l => l.replace(/\r$/, ''));
-  const ops: EditOp[] = [];
-  let i = 0, lastPath = '';
-  while (i < lines.length) {
-    if (lines[i].trimEnd() === '<<<<<<< SEARCH') {
-      const searchLineNum = i + 1;
-      let foundPath = '';
-      for (let pIdx = i - 1; pIdx >= 0; pIdx--) {
-        const pLine = lines[pIdx].trim();
-        if (pLine !== '' && !pLine.startsWith('```') && !pLine.startsWith('>>>>>>> REPLACE')) { foundPath = pLine; break; }
-        if (pLine.startsWith('>>>>>>> REPLACE')) break;
+  const sourceLines = patchText.split('\n').map(l => l.replace(/\r$/, ''));
+  const collectedOps: EditOp[] = [];
+  let cursor = 0, previousPath = '';
+  while (cursor < sourceLines.length) {
+    if (sourceLines[cursor].trimEnd() === '<<<<<<< SEARCH') {
+      const markerRow = cursor + 1;
+      let locatedPath = '';
+      for (let scanIdx = cursor - 1; scanIdx >= 0; scanIdx--) {
+        const candidate = sourceLines[scanIdx].trim();
+        if (candidate !== '' && !candidate.startsWith('```') && !candidate.startsWith('>>>>>>> REPLACE')) {
+          locatedPath = candidate;
+          break;
+        }
+        if (candidate.startsWith('>>>>>>> REPLACE')) break;
       }
-      if (!foundPath && lastPath) foundPath = lastPath;
-      if (!foundPath) return { ops: [], error: { line: searchLineNum } };
-      lastPath = foundPath;
-      i++;
-      const oldLines: string[] = [];
-      let foundSeparator = false, sepLineNum = 0;
-      while (i < lines.length) {
-        if (lines[i].trimEnd() === '=======') { foundSeparator = true; sepLineNum = i + 1; i++; break; }
-        oldLines.push(lines[i]);
-        i++;
+      if (!locatedPath && previousPath) locatedPath = previousPath;
+      if (!locatedPath) return { ops: [], error: { line: markerRow } };
+      previousPath = locatedPath;
+
+      cursor++;
+      const oldBlock: string[] = [];
+      while (cursor < sourceLines.length && sourceLines[cursor].trimEnd() !== '=======') {
+        oldBlock.push(sourceLines[cursor]);
+        cursor++;
       }
-      if (!foundSeparator) return { ops: [], error: { line: searchLineNum } };
-      const newLines: string[] = [];
+      if (cursor >= sourceLines.length || sourceLines[cursor].trimEnd() !== '=======') return { ops: [], error: { line: markerRow } };
+      cursor++;
+
+      const newBlock: string[] = [];
       let foundReplace = false;
-      while (i < lines.length) {
-        if (lines[i].trimEnd() === '>>>>>>> REPLACE') { foundReplace = true; i++; break; }
-        newLines.push(lines[i]);
-        i++;
+      while (cursor < sourceLines.length) {
+        if (sourceLines[cursor].trimEnd() === '>>>>>>> REPLACE') {
+          foundReplace = true;
+          cursor++;
+          break;
+        }
+        newBlock.push(sourceLines[cursor]);
+        cursor++;
       }
-      if (!foundReplace) return { ops: [], error: { line: sepLineNum } };
-      if (oldLines.length === 0) ops.push({ type: 'create', path: foundPath, content: newLines });
-      else ops.push({ type: 'update', path: foundPath, hunks: [{ o: oldLines, n: newLines, hasEol: true }] });
-      continue;
+      if (!foundReplace) return { ops: [], error: { line: cursor } };
+
+      if (oldBlock.length === 0) {
+        collectedOps.push({ type: 'create', path: locatedPath, content: newBlock });
+      } else {
+        collectedOps.push({ type: 'update', path: locatedPath, hunks: [{ o: oldBlock, n: newBlock, hasEol: true }] });
+      }
+    } else {
+      cursor++;
     }
-    i++;
   }
-  return { ops };
+  return { ops: collectedOps };
 }
 
 function parseV4a(patchText: string): { ops: EditOp[]; error?: { line: number } } {
-  const lines = patchText.split('\n').map(l => l.replace(/\r$/, ''));
-  let firstIdx = -1, firstText = '';
-  for (let idx = 0; idx < lines.length; idx++) { if (lines[idx].trim() !== '') { firstIdx = idx; firstText = lines[idx].trim(); break; } }
-  if (firstText !== '*** Begin Patch') return { ops: [], error: { line: firstIdx >= 0 ? firstIdx + 1 : 1 } };
-  let lastIdx = -1, lastText = '';
-  for (let idx = lines.length - 1; idx >= 0; idx--) { if (lines[idx].trim() !== '') { lastIdx = idx; lastText = lines[idx].trim(); break; } }
-  if (lastText !== '*** End Patch') return { ops: [], error: { line: lines.length } };
-  
-  const ops: EditOp[] = [];
-  let i = firstIdx + 1;
-  while (i < lastIdx) {
-    if (lines[i].trim() === '') { i++; continue; }
-    const trimmed = lines[i].trim();
-    if (trimmed.startsWith('*** Add File:')) {
-      const fPath = trimmed.slice(13).trim();
-      i++;
-      const addLines: string[] = [];
-      while (i < lastIdx) {
-        if (lines[i].trim().startsWith('***')) break;
-        if (lines[i].startsWith('+')) { addLines.push(lines[i].slice(1)); i++; }
-        else if (lines[i] === '') {
-           let peek = i, hasMore = false;
-           while(peek < lastIdx) { if(lines[peek].trim() !== '') { if(lines[peek].trim().startsWith('***')) break; hasMore = true; break; } peek++; }
-           if(hasMore) { addLines.push(''); i++; } else break;
-        } else return { ops: [], error: { line: i + 1 } };
+  const sourceLines = patchText.split('\n').map(l => l.replace(/\r$/, ''));
+  let firstValid = -1, firstText = '';
+  for (let i = 0; i < sourceLines.length; i++) {
+    if (sourceLines[i].trim() !== '') { firstValid = i; firstText = sourceLines[i].trim(); break; }
+  }
+  if (firstText !== '*** Begin Patch') return { ops: [], error: { line: firstValid >= 0 ? firstValid + 1 : 1 } };
+  let lastValid = -1, lastText = '';
+  for (let i = sourceLines.length - 1; i >= 0; i--) {
+    if (sourceLines[i].trim() !== '') { lastValid = i; lastText = sourceLines[i].trim(); break; }
+  }
+  if (lastText !== '*** End Patch') return { ops: [], error: { line: sourceLines.length } };
+
+  const collectedOps: EditOp[] = [];
+  let cursor = firstValid + 1;
+  while (cursor < lastValid) {
+    if (sourceLines[cursor].trim() === '') { cursor++; continue; }
+    const rowTrim = sourceLines[cursor].trim();
+    if (rowTrim.startsWith('*** Add File:')) {
+      const fPath = rowTrim.slice(13).trim();
+      cursor++;
+      const addRows: string[] = [];
+      while (cursor < lastValid) {
+        if (sourceLines[cursor].trim().startsWith('***')) break;
+        if (sourceLines[cursor].startsWith('+')) { addRows.push(sourceLines[cursor].slice(1)); cursor++; }
+        else if (sourceLines[cursor] === '') {
+          let peekIdx = cursor, hasMoreContent = false;
+          while (peekIdx < lastValid) {
+            if (sourceLines[peekIdx].trim() !== '') {
+              if (sourceLines[peekIdx].trim().startsWith('***')) break;
+              hasMoreContent = true;
+              break;
+            }
+            peekIdx++;
+          }
+          if (hasMoreContent) { addRows.push(''); cursor++; } else break;
+        } else return { ops: [], error: { line: cursor + 1 } };
       }
-      ops.push({ type: 'create', path: fPath, content: addLines });
-    } else if (trimmed.startsWith('*** Delete File:')) {
-      ops.push({ type: 'delete', path: trimmed.slice(16).trim() }); i++;
-    } else if (trimmed.startsWith('*** Update File:')) {
-      const fPath = trimmed.slice(16).trim();
-      const updateLine = i + 1;
-      i++;
+      collectedOps.push({ type: 'create', path: fPath, content: addRows });
+    } else if (rowTrim.startsWith('*** Delete File:')) {
+      collectedOps.push({ type: 'delete', path: rowTrim.slice(16).trim() });
+      cursor++;
+    } else if (rowTrim.startsWith('*** Update File:')) {
+      const fPath = rowTrim.slice(16).trim();
+      const updateLineNum = cursor + 1;
+      cursor++;
       let movePath: string | undefined;
-      while (i < lastIdx && lines[i].trim() === '') i++;
-      if (i < lastIdx && lines[i].trim().startsWith('*** Move to:')) { movePath = lines[i].trim().slice(12).trim(); i++; }
+      while (cursor < lastValid && sourceLines[cursor].trim() === '') cursor++;
+      if (cursor < lastValid && sourceLines[cursor].trim().startsWith('*** Move to:')) {
+        movePath = sourceLines[cursor].trim().slice(12).trim();
+        cursor++;
+      }
       const chunks: { anchor?: string; o: string[]; n: string[]; isEof?: boolean; body?: { type: string; text: string }[] }[] = [];
-      while (i < lastIdx) {
-        if (lines[i].trim() === '') { i++; continue; }
-        if (lines[i].trim().startsWith('***')) break;
-        let anchor: string | undefined;
-        if (lines[i].trim().startsWith('@@')) { anchor = lines[i].trim().slice(2).trim(); i++; }
-        const chunkBody: { type: string; text: string }[] = [];
-        let isEof = false;
-        while (i < lastIdx) {
-          const bLine = lines[i];
-          const bTrim = bLine.trim();
-          if (bTrim === '' || bTrim.startsWith('@@') || bTrim.startsWith('*** End of File') || bTrim.startsWith('***')) {
-            if (bTrim.startsWith('*** End of File')) { isEof = true; i++; }
+      while (cursor < lastValid) {
+        if (sourceLines[cursor].trim() === '') { cursor++; continue; }
+        if (sourceLines[cursor].trim().startsWith('***')) break;
+        let anchorText: string | undefined;
+        if (sourceLines[cursor].trim().startsWith('@@')) {
+          anchorText = sourceLines[cursor].trim().slice(2).trim();
+          cursor++;
+        }
+        const chunkBodyRows: { type: string; text: string }[] = [];
+        let reachesEof = false;
+        while (cursor < lastValid) {
+          const bodyLine = sourceLines[cursor];
+          const bodyTrim = bodyLine.trim();
+          if (bodyTrim === '' || bodyTrim.startsWith('@@') || bodyTrim.startsWith('*** End of File') || bodyTrim.startsWith('***')) {
+            if (bodyTrim.startsWith('*** End of File')) { reachesEof = true; cursor++; }
             break;
           }
-          if (bLine.startsWith(' ') || bLine.startsWith('-') || bLine.startsWith('+')) { chunkBody.push({ type: bLine[0], text: bLine.slice(1) }); i++; }
-          else if (bLine === '') { chunkBody.push({ type: ' ', text: '' }); i++; }
-          else break;
+          if (bodyLine.startsWith(' ') || bodyLine.startsWith('-') || bodyLine.startsWith('+')) {
+            chunkBodyRows.push({ type: bodyLine[0], text: bodyLine.slice(1) });
+            cursor++;
+          } else if (bodyLine === '') {
+            chunkBodyRows.push({ type: ' ', text: '' });
+            cursor++;
+          } else {
+            break;
+          }
         }
-        while (chunkBody.length > 0 && chunkBody[chunkBody.length - 1].type === ' ' && chunkBody[chunkBody.length - 1].text === '') chunkBody.pop();
-        if (!anchor && chunkBody.length === 0 && !isEof) { if (chunks.length === 0 && !movePath) return { ops: [], error: { line: updateLine } }; break; }
-        let oLines: string[] = [], nLines: string[] = [];
-        for (const cb of chunkBody) {
-          if (cb.type === ' ') { oLines.push(cb.text); nLines.push(cb.text); }
-          else if (cb.type === '-') { oLines.push(cb.text); }
-          else if (cb.type === '+') { nLines.push(cb.text); }
+        while (chunkBodyRows.length > 0 && chunkBodyRows[chunkBodyRows.length - 1].type === ' ' && chunkBodyRows[chunkBodyRows.length - 1].text === '') {
+          chunkBodyRows.pop();
         }
-        chunks.push({ anchor, o: oLines, n: nLines, isEof, body: chunkBody });
-        if (isEof) break;
+        if (!anchorText && chunkBodyRows.length === 0 && !reachesEof) {
+          if (chunks.length === 0 && !movePath) return { ops: [], error: { line: updateLineNum } };
+          break;
+        }
+        let oldSeq: string[] = [], newSeq: string[] = [];
+        for (const item of chunkBodyRows) {
+          if (item.type === ' ') { oldSeq.push(item.text); newSeq.push(item.text); }
+          else if (item.type === '-') { oldSeq.push(item.text); }
+          else if (item.type === '+') { newSeq.push(item.text); }
+        }
+        chunks.push({ anchor: anchorText, o: oldSeq, n: newSeq, isEof: reachesEof, body: chunkBodyRows });
+        if (reachesEof) break;
       }
-      ops.push({ type: movePath ? 'rename' : 'update', path: fPath, newPath: movePath, chunks });
-    } else return { ops: [], error: { line: i + 1 } };
+      collectedOps.push({ type: movePath ? 'rename' : 'update', path: fPath, newPath: movePath, chunks });
+    } else return { ops: [], error: { line: cursor + 1 } };
   }
-  return { ops };
+  return { ops: collectedOps };
 }
 
 function parseJsonEdits(patchText: string): { ops: EditOp[]; error?: { line: number } } {
-  const trimmed = patchText.trim();
-  const lines = patchText.split('\n');
-  if (trimmed.startsWith('[')) {
-    let startLine = 1;
-    for (let idx = 0; idx < lines.length; idx++) { if (lines[idx].trim().startsWith('[')) { startLine = idx + 1; break; } }
-    let arr: any;
-    try { arr = JSON.parse(patchText); } catch (e) { return { ops: [], error: { line: startLine } }; }
-    if (!Array.isArray(arr)) return { ops: [], error: { line: startLine } };
-    const ops: EditOp[] = [];
-    for (const item of arr) {
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return { ops: [], error: { line: startLine } };
-      const cmd = item.command, p = item.path;
-      if (!p || typeof p !== 'string') return { ops: [], error: { line: startLine } };
-      if (cmd === 'create' && typeof item.file_text === 'string') ops.push({ type: 'create', path: p, fileText: item.file_text });
-      else if (cmd === 'str_replace' && typeof item.old_str === 'string' && item.old_str !== '' && (item.new_str === undefined || typeof item.new_str === 'string')) ops.push({ type: 'update', path: p, oldStr: item.old_str, newStr: item.new_str || '' });
-      else if (cmd === 'insert' && Number.isInteger(item.insert_line) && typeof item.new_str === 'string') ops.push({ type: 'update', path: p, insertLine: item.insert_line, newStr: item.new_str });
-      else return { ops: [], error: { line: startLine } };
+  const stripped = patchText.trim();
+  const sourceLines = patchText.split('\n');
+  if (stripped.startsWith('[')) {
+    let startingLine = 1;
+    for (let idx = 0; idx < sourceLines.length; idx++) {
+      if (sourceLines[idx].trim().startsWith('[')) { startingLine = idx + 1; break; }
     }
-    return { ops };
+    let parsedArray: any;
+    try { parsedArray = JSON.parse(patchText); } catch (e) { return { ops: [], error: { line: startingLine } }; }
+    if (!Array.isArray(parsedArray)) return { ops: [], error: { line: startingLine } };
+    const collectedOps: EditOp[] = [];
+    for (const elem of parsedArray) {
+      if (!elem || typeof elem !== 'object' || Array.isArray(elem)) return { ops: [], error: { line: startingLine } };
+      const actionCmd = elem.command, targetP = elem.path;
+      if (!targetP || typeof targetP !== 'string') return { ops: [], error: { line: startingLine } };
+      if (actionCmd === 'create' && typeof elem.file_text === 'string') {
+        collectedOps.push({ type: 'create', path: targetP, fileText: elem.file_text });
+      } else if (actionCmd === 'str_replace' && typeof elem.old_str === 'string' && elem.old_str !== '' && (elem.new_str === undefined || typeof elem.new_str === 'string')) {
+        collectedOps.push({ type: 'update', path: targetP, oldStr: elem.old_str, newStr: elem.new_str || '' });
+      } else if (actionCmd === 'insert' && Number.isInteger(elem.insert_line) && typeof elem.new_str === 'string') {
+        collectedOps.push({ type: 'update', path: targetP, insertLine: elem.insert_line, newStr: elem.new_str });
+      } else {
+        return { ops: [], error: { line: startingLine } };
+      }
+    }
+    return { ops: collectedOps };
   } else {
-    const ops: EditOp[] = [];
-    for (let idx = 0; idx < lines.length; idx++) {
-      const l = lines[idx].replace(/\r$/, '');
-      if (l.trim() === '') continue;
-      let item: any;
-      try { item = JSON.parse(l); } catch (e) { return { ops: [], error: { line: idx + 1 } }; }
-      if (!item || typeof item !== 'object' || Array.isArray(item)) return { ops: [], error: { line: idx + 1 } };
-      const cmd = item.command, p = item.path;
-      if (!p || typeof p !== 'string') return { ops: [], error: { line: idx + 1 } };
-      if (cmd === 'create' && typeof item.file_text === 'string') ops.push({ type: 'create', path: p, fileText: item.file_text });
-      else if (cmd === 'str_replace' && typeof item.old_str === 'string' && item.old_str !== '' && (item.new_str === undefined || typeof item.new_str === 'string')) ops.push({ type: 'update', path: p, oldStr: item.old_str, newStr: item.new_str || '' });
-      else if (cmd === 'insert' && Number.isInteger(item.insert_line) && typeof item.new_str === 'string') ops.push({ type: 'update', path: p, insertLine: item.insert_line, newStr: item.new_str });
-      else return { ops: [], error: { line: idx + 1 } };
+    const collectedOps: EditOp[] = [];
+    for (let idx = 0; idx < sourceLines.length; idx++) {
+      const currentLine = sourceLines[idx].replace(/\r$/, '');
+      if (currentLine.trim() === '') continue;
+      let singleObj: any;
+      try { singleObj = JSON.parse(currentLine); } catch (e) { return { ops: [], error: { line: idx + 1 } }; }
+      if (!singleObj || typeof singleObj !== 'object' || Array.isArray(singleObj)) return { ops: [], error: { line: idx + 1 } };
+      const actionCmd = singleObj.command, targetP = singleObj.path;
+      if (!targetP || typeof targetP !== 'string') return { ops: [], error: { line: idx + 1 } };
+      if (actionCmd === 'create' && typeof singleObj.file_text === 'string') {
+        collectedOps.push({ type: 'create', path: targetP, fileText: singleObj.file_text });
+      } else if (actionCmd === 'str_replace' && typeof singleObj.old_str === 'string' && singleObj.old_str !== '' && (singleObj.new_str === undefined || typeof singleObj.new_str === 'string')) {
+        collectedOps.push({ type: 'update', path: targetP, oldStr: singleObj.old_str, newStr: singleObj.new_str || '' });
+      } else if (actionCmd === 'insert' && Number.isInteger(singleObj.insert_line) && typeof singleObj.new_str === 'string') {
+        collectedOps.push({ type: 'update', path: targetP, insertLine: singleObj.insert_line, newStr: singleObj.new_str });
+      } else {
+        return { ops: [], error: { line: idx + 1 } };
+      }
     }
-    return { ops };
+    return { ops: collectedOps };
   }
 }
 
