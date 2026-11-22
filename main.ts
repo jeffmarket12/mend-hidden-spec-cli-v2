@@ -50,3 +50,84 @@ function serializeFileContent(fl: FileLines): string {
   const body = fl.lines.join(sep);
   return body + (fl.hasEndingNewline ? sep : '');
 }
+
+// --- Argument Parsing & CLI & Output Formatting ---
+
+interface ParsedArgs {
+  format?: PatchFormat;
+  check: boolean;
+  strict: boolean;
+  patchPath: string | null;
+}
+
+function parseCliArgs(args: string[]): { args: ParsedArgs | null; error?: string } {
+  let format: PatchFormat | undefined;
+  let check = false;
+  let strict = false;
+  let patchPath: string | null = null;
+  const positional: string[] = [];
+
+  let i = 0;
+  while (i < args.length) {
+    const arg = args[i];
+    if (arg === '--') {
+      i++;
+      while (i < args.length) {
+        positional.push(args[i]);
+        i++;
+      }
+      break;
+    }
+    if (arg.startsWith('-') && arg !== '-') {
+      if (arg.startsWith('--format=')) {
+        if (format !== undefined) return { args: null, error: 'duplicate option' };
+        const val = arg.slice(9);
+        if (val !== 'unified' && val !== 'search-replace' && val !== 'v4a' && val !== 'json' && val !== 'auto') {
+          return { args: null, error: 'invalid format' };
+        }
+        if (val === 'auto') {
+          format = undefined;
+        } else {
+          format = val as PatchFormat;
+        }
+      } else if (arg === '--check') {
+        if (check) return { args: null, error: 'duplicate option' };
+        check = true;
+      } else if (arg === '--strict') {
+        if (strict) return { args: null, error: 'duplicate option' };
+        strict = true;
+      } else {
+        return { args: null, error: 'unknown option' };
+      }
+    } else {
+      positional.push(arg);
+    }
+    i++;
+  }
+
+  if (positional.length > 1) {
+    return { args: null, error: 'too many positional args' };
+  }
+  if (positional.length === 1) {
+    patchPath = positional[0];
+  }
+
+  return { args: { format, check, strict, patchPath } };
+}
+
+interface EditOperation {
+  type: 'update' | 'create' | 'delete' | 'move';
+  path: string;
+  oldPath?: string; // for move
+  newPath?: string; // for move
+  searchLines?: string[];
+  replaceLines?: string[];
+  fileText?: string; // for create / json
+  hunks?: any[]; // for unified
+}
+
+interface ApplyResult {
+  success: boolean;
+  errorCode?: 'no-match' | 'ambiguous' | 'missing' | 'exists' | 'unsafe';
+  errorPath?: string;
+}
