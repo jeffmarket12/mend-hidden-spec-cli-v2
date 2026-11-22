@@ -1109,7 +1109,7 @@ function main() {
     } else if (edit.type === 'move') {
       const oldP = edit.oldPath!;
       const newP = edit.newPath!;
-      const vOld = getVirtualFile(oldP);
+      let vOld = getVirtualFile(oldP);
       const vNew = getVirtualFile(newP);
       if (!vOld.exists) {
         errorLines.push(`error: missing ${oldP}`);
@@ -1121,7 +1121,7 @@ function main() {
       }
       if (edit.hunks) {
         if (!vOld.lines && vOld.raw !== undefined) vOld.lines = parseFileContent(vOld.raw);
-        const res = applyUnifiedHunks(vOld.lines || { lines: [], crlf: false, hasEndingNewline: false }, edit.hunks, true);
+        const res = applyUnifiedHunks(vOld.lines || { lines: [], crlf: false, hasEndingNewline: false }, edit.hunks, strict);
         if (!res.success) {
           errorLines.push('error: ' + (res.error?.code || 'no-match') + ' ' + oldP);
           continue;
