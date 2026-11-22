@@ -756,9 +756,10 @@ function matchSearchBlock(
 function applyUnifiedHunks(
   fileLines: { lines: string[]; hasEndingNewline: boolean },
   hunks: Array<{ oldStart: number; newStart: number; lines: Array<{ type: ' ' | '-' | '+'; text: string }>; noNewlineAtEndOfFile?: boolean }>
-, strict: boolean): { success: boolean; lines?: string[]; error?: { code: string } } {
+, strict: boolean): { success: boolean; lines?: string[]; error?: { code: string }; hasEndingNewline?: boolean } {
   let lines = [...fileLines.lines];
   let d = 0;
+  let lastHunkTouchesEnd = false;
 
   for (const hunk of hunks) {
     const O: { text: string; type: ' ' | '-' }[] = [];
