@@ -515,3 +515,108 @@ function parseJsonPatch(text: string): ParseResult {
     return { edits: [], error: { code: 'parse', line: 1 } };
   }
 }
+
+// --- Matching Engine ---
+
+function getIndent(line: string): string {
+  const m = line.match(/^([ \t]*)/);
+  return m ? m[1] : '';
+}
+
+function stripIndent(line: string): string {
+  return line.replace(/^[ \t]*/, '');
+}
+
+function matchSearchBlock(
+  fileLines: string[],
+  searchLines: string[],
+  hintIndex: number,
+  strict: boolean
+): { index: number; tier: number; count: number } {
+  if (searchLines.length === 0) {
+    return { index: -1, tier: -1, count: 0 };
+  }
+
+  // Tiers to try:
+  // If strict is true, only tier 0. Otherwise tiers 0, 1, 2.
+  const maxTier = strict ? 0 : 2;
+
+  for (let tier = 0; tier <= maxTier; tier++) {
+    const matches: number[] = [];
+
+    for (let i = 0; i <= fileLines.length - searchLines.length; i++) {
+      let matched = true;
+      let indentDiff = 0;
+
+      if (tier === 0) {
+        // Exact match
+        for (let j = 0; j < searchLines.length; j++) {
+          if (fileLines[i + j] !== searchLines[j]) {
+            matched = false;
+            break;
+          }
+        }
+      } else if (tier === 1) {
+        // Trailing-whitespace-insensitive
+        for (let j = 0; j < searchLines.length; j++) {
+          if (fileLines[i + j].trimEnd() !== searchLines[j].trimEnd()) {
+            matched = false;
+            break;
+          }
+        }
+      } else if (tier === 2) {
+        // Indent-insensitive
+        // Check if all non-empty lines have proportional or matching relative indentation, or stripped content matches
+        const fileFirst = fileLines[i];
+        const searchFirst = searchLines[0];
+        const fileIndent = getIndent(fileFirst);
+        const searchIndent = getIndent(searchFirst);
+        // Calculate indent difference if both have indentation
+        indentDiff = fileIndent.length - searchIndent.
+          length; // Or check line-by-line relative match
+
+        for (let j = 0; j < searchLines.length; j++) {
+          const fLine = fileLines[i + j];
+          const sLine = searchLines[j];
+          if (fLine.trim() === '' && sLine.trim() === '') {
+            continue;
+          }
+          if (stripIndent(fLine) !== stripIndent(sLine)) {
+            matched = false;
+            break;
+          }
+        }
+      }
+
+      if (matched) {
+        matches.push(i);
+      }
+    }
+
+    if (matches.length > 0) {
+      if (matches.length === 1) {
+        return { index: matches[0], tier, count: 1 };
+      }
+      // If multiple matches, use hintIndex if valid, otherwise ambiguous (count > 1)
+      if (hintIndex >= 0 && matches.includes(hintIndex)) {
+        return { index: hintIndex, tier, count: matches.length };
+      }
+      // Pick closest to hintIndex if hintIndex >= 0
+      if (hintIndex >= 0) {
+        let best = matches[0];
+        let bestDist = Math.abs(best - hintIndex);
+        for (let m = 1; m < matches.length; m++) {
+          const dist = Math.abs(matches[m] - hintIndex);
+          if (dist < bestDist) {
+            bestDist = dist;
+            best = matches[m];
+          }
+        }
+        return { index: best, tier, count: matches.length };
+      }
+      return { index: matches[0], tier, count: matches.length };
+    }
+  }
+
+  return { index: -1, tier: -1, count: 0 };
+}
