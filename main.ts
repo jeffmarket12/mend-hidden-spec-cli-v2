@@ -984,4 +984,132 @@ async function main() {
   console.log(`ok: ${finalFileActions.length} ${finalFileActions.length === 1 ? 'file' : 'files'}`);
   process.exit(0);
 }
-main();
+
+// --- MEND NEW FEATURES ---
+interface MendStats {
+  filesTouched: Set<string>;
+  hunksApplied: number;
+  formats: Record<string, number>;
+  startTime: number;
+  endTime: number;
+  exitCode: number;
+}
+
+const mendStats: MendStats = {
+  filesTouched: new Set<string>(),
+  hunksApplied: 0,
+  formats: { unified: 0, search_replace: 0, v4a: 0, json: 0, unknown: 0 },
+  startTime: Date.now(),
+  endTime: 0,
+  exitCode: 0
+};
+
+const mendArgs = process.argv.slice(2);
+const isPreview = mendArgs.includes('--preview');
+const isVerbose = mendArgs.includes('--verbose');
+const isStats = mendArgs.includes('--stats');
+
+function logVerbose(msg: string) {
+  if (isVerbose) {
+    process.stderr.write(`[mend verbose] ${msg}\n`);
+  }
+}
+
+function parsePatchLightweight(args: string[]): { format: string; files: string[]; hunks: number } {
+  logVerbose(`Analyzing args for preview/stats: ${args.join(' ')}`);
+  let format = 'unified';
+  const files = new Set<string>();
+  let hunks = 0;
+
+  for (const arg of args) {
+    if (arg.startsWith('-')) continue;
+    try {
+      const fs = require('fs');
+      if (fs.existsSync(arg)) {
+        const content = fs.readFileSync(arg, 'utf8');
+        const lines = content.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('--- a/') || line.startsWith('+++ b/')) {
+            files.add(line.slice(6).trim());
+            hunks++;
+          } else if (line.startsWith('*** Update File:') || line.startsWith('*** Add File:') || line.startsWith('*** Delete File:')) {
+            files.add(line.replace(/^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*/, '').trim());
+            hunks++;
+          } else if (line.startsWith('@@ ')) {
+            hunks++;
+          }
+        }
+        if (content.includes('*** Begin Patch') || content.includes('*** Update File:')) {
+          format = 'v4a';
+        } else if (content.includes('<<<<<<<')) {
+          format = 'search_replace';
+        } else if (content.startsWith('{') || content.startsWith('[')) {
+          format = 'json';
+        }
+      }
+    } catch {}
+  }
+
+  if (files.size === 0) {
+    files.add('stdin/unknown');
+    hunks = 1;
+  }
+
+  return { format, files: Array.from(files), hunks: Math.max(hunks, files.size) };
+}
+
+if (isPreview) {
+  logVerbose("--preview flag detected. Generating preview summary.");
+  const summary = parsePatchLightweight(mendArgs);
+  console.log("=== MEND PATCH PREVIEW ===");
+  console.log(`Format: ${summary.format}`);
+  console.log(`Files (${summary.files.length}):`);
+  for (const file of summary.files) {
+    console.log(`  - ${file}`);
+  }
+  console.log(`Hunks / Operations: ${summary.hunks}`);
+  console.log("Preview completed successfully. No changes applied.");
+  process.exit(0);
+}
+
+process.on('exit', (code) => {
+  if (!isStats) return;
+  mendStats.endTime = Date.now();
+  mendStats.exitCode = code;
+  const duration = mendStats.endTime - mendStats.startTime;
+
+  const summary = parsePatchLightweight(mendArgs);
+  for (const f of summary.files) {
+    mendStats.filesTouched.add(f);
+  }
+  mendStats.hunksApplied = summary.hunks;
+  mendStats.formats[summary.format] = (mendStats.formats[summary.format] || 0) + 1;
+
+  process.stderr.write(`\n=== MEND EXECUTION STATS ===\n`);
+  process.stderr.write(`Files Touched: ${mendStats.filesTouched.size}\n`);
+  for (const f of mendStats.filesTouched) {
+    process.stderr.write(`  - ${f}\n`);
+  }
+  process.stderr.write(`Hunks Applied: ${mendStats.hunksApplied}\n`);
+  process.stderr.write(`Format: ${summary.format}\n`);
+  process.stderr.write(`Elapsed Time: ${duration} ms\n`);
+  process.stderr.write(`Exit Status: ${mendStats.exitCode}\n`);
+});
+
+async function runMendWrapped() {
+  logVerbose("Invoking main() from runMendWrapped");
+  // Filter out our custom flags before calling main()
+  process.argv = [
+    process.argv[0],
+    process.argv[1],
+    ...process.argv.slice(2).filter(arg => arg !== "--stats" && arg !== "--verbose" && arg !== "--preview")
+  ];
+  try {
+    await main();
+  } catch (err) {
+    console.error(err);
+    process.exit(1);
+  }
+}
+
+runMendWrapped();
