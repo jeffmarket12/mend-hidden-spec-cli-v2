@@ -439,7 +439,7 @@ function parseV4A(text: string): ParseResult {
     }
 
     if (trimmed.startsWith("*** Delete File:")) {
-      const path = trimmed.slice(15).trim();
+      const path = trimmed.slice(16).trim();
       i++;
       const secLines: Array<{ line: string; num: number }> = [];
       while (i < endIdx) {
@@ -464,7 +464,7 @@ function parseV4A(text: string): ParseResult {
 
     if (trimmed.startsWith("*** Update File:")) {
       const updateLineNum = i + 1;
-      const path = trimmed.slice(15).trim();
+      const path = trimmed.slice(16).trim();
       i++;
       const secLines: Array<{ line: string; num: number }> = [];
       while (i < endIdx) {
@@ -483,7 +483,7 @@ function parseV4A(text: string): ParseResult {
       let chunkStartIdx = 0;
 
       if (trimmedSecLines.length > 0 && trimmedSecLines[0].line.trim().startsWith("*** Move to:")) {
-        movePath = trimmedSecLines[0].line.trim().slice(11).trim();
+        movePath = trimmedSecLines[0].line.trim().slice(12).trim();
         chunkStartIdx = 1;
       }
 
