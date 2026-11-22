@@ -188,6 +188,7 @@ function parseUnifiedDiff(text: string): ParseResult {
 
   function finishHunk() {
     if (curHunk && currentSection) {
+      while (curHunk.lines.length > 0) { const last = curHunk.lines[curHunk.lines.length - 1]; if (last.type === ' ' && last.text === '') curHunk.lines.pop(); else break; }
       currentSection.hunks.push(curHunk);
       curHunk = null;
     }
@@ -273,6 +274,8 @@ function parseUnifiedDiff(text: string): ParseResult {
     if (curHunk && (line.startsWith(' ') || line.startsWith('+') || line.startsWith('-') || line === '' || line.startsWith('\\\\'))) {
         if (line.startsWith('\\\\')) {
             curHunk.noNewlineAtEndOfFile = true;
+        } else if (line === '') {
+            curHunk.lines.push({ type: ' ', text: '' });
         } else {
             curHunk.lines.push({ type: line[0], text: line.slice(1) });
         }
@@ -792,6 +795,7 @@ function applyUnifiedHunks(
     if (matchIndex === -1) {
       return { success: false, error: { code: 'no-match' } };
     }
+    lastHunkTouchesEnd = O.length > 0 ? (matchIndex + O.length === lines.length) : (matchIndex === lines.length);
 
     // Build finalN
     const finalN: string[] = [];
@@ -829,7 +833,7 @@ function applyUnifiedHunks(
     d += (N.length - O.length);
   }
 
-  return { success: true, lines };
+  return { success: true, lines, hasEndingNewline: lastHunkTouchesEnd ? !hunks[hunks.length - 1].noNewlineAtEndOfFile : fileLines.hasEndingNewline };
 }
 function applyV4AUpdate(fileLines: FileLines, chunks: Array<{ anchor: string | null; oldLines: string[]; newLines: string[]; endOfFile: boolean; isContext: boolean[]; oIndex: number[] }>, strict: boolean): { success: boolean; lines?: string[]; error?: { code: string } } {
   let lines = [...fileLines.lines];
@@ -931,7 +935,7 @@ function applyV4AUpdate(fileLines: FileLines, chunks: Array<{ anchor: string | n
             finalN.push(lines[targetIdx + chunk.oIndex[i]]);
         } else {
             let line = N[i];
-            if (targetTier === 2 && line.trim() !== "" && searchIndent !== "" && line.startsWith(searchIndent)) {
+            if (targetTier === 2 && line.trim() !== "" && line.startsWith(searchIndent)) {
                 line = fileIndent + line.slice(searchIndent.length);
             }
             finalN.push(line);
@@ -1122,7 +1126,7 @@ function main() {
           errorLines.push('error: ' + (res.error?.code || 'no-match') + ' ' + oldP);
           continue;
         }
-        vOld = { exists: true, lines: { lines: res.lines!, crlf: vOld.lines?.crlf ?? false, hasEndingNewline: vOld.lines?.hasEndingNewline ?? true } };
+        vOld = { exists: true, lines: { lines: res.lines!, crlf: vOld.lines?.crlf ?? false, hasEndingNewline: res.hasEndingNewline ?? vOld.lines?.hasEndingNewline ?? true } };
       }
       virtualFiles.set(oldP, { exists: false });
       virtualFiles.set(newP, vOld);
@@ -1171,7 +1175,7 @@ function main() {
         v.lines = {
           lines: res.lines!,
           crlf: v.lines?.crlf ?? false,
-          hasEndingNewline: v.lines?.hasEndingNewline ?? true
+          hasEndingNewline: res.hasEndingNewline ?? v.lines?.hasEndingNewline ?? true
         };
         plannedChanges.push({ type: 'M', path: edit.path });
       } else if (edit.chunks) {
