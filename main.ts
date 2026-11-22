@@ -271,8 +271,8 @@ function parseUnifiedDiff(text: string): ParseResult {
       i++;
       continue;
     }
-    if (curHunk && (line.startsWith(' ') || line.startsWith('+') || line.startsWith('-') || line === '' || line.startsWith('\\\\'))) {
-        if (line.startsWith('\\\\')) {
+    if (curHunk && (line.startsWith(' ') || line.startsWith('+') || line.startsWith('-') || line === '' || line.startsWith('\\'))) {
+        if (line.startsWith('\\')) {
             curHunk.noNewlineAtEndOfFile = true;
         } else if (line === '') {
             curHunk.lines.push({ type: ' ', text: '' });
