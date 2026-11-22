@@ -276,82 +276,74 @@ function parseSearchReplace(text: string): ParseResult {
   const lines = text.split(/\r?\n/);
   const edits: EditOperation[] = [];
   let i = 0;
+  let lastPath: string | null = null;
 
   while (i < lines.length) {
-    const line = lines[i];
-    if (line.trim() === '' || line.startsWith('#')) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+    if (trimmed === '' || trimmed.startsWith('#') || trimmed.startsWith('```')) {
       i++;
       continue;
     }
 
-    // Check for file header: <<<<<<< file: path or similar or just <<<<<<< SEARCH
-    let targetPath: string | null = null;
-    if (line.startsWith('<<<<<<< file:')) {
-      targetPath = line.slice(13).trim();
-      i++;
-    } else if (line.startsWith('<<<<<<< SEARCH')) {
-      i++;
-    } else {
-      // Maybe look for file: path header preceding SEARCH
-      if (line.startsWith('=== file:') || line.startsWith('file:')) {
-        targetPath = line.split(':')[1].trim();
-        i++;
-        continue;
+    if (trimmed.startsWith('<<<<<<< SEARCH')) {
+      // Find path backwards
+      let targetPath: string | null = lastPath;
+      let scan = i - 1;
+      while (scan >= 0) {
+        const pLine = lines[scan].trim();
+        if (pLine !== '' && !pLine.startsWith('#') && !pLine.startsWith('```')) {
+          targetPath = pLine;
+          break;
+        }
+        scan--;
       }
+      if (!targetPath) {
+        return { edits: [], error: { code: 'parse', line: i + 1 } };
+      }
+      lastPath = targetPath;
       i++;
-      continue;
-    }
 
-    // If targetPath not set yet, check if next lines specify it or if there's an explicit file header above
-    // In search-replace, often format is:
-    // path/to/file
-    // <<<<<<< SEARCH
-    // ...
-    // =======
-    // ...
-    // >>>>>>> REPLACE
-    
-    // Let's parse SEARCH lines
-    const searchLines: string[] = [];
-    let searchStartLine = i + 1;
-    while (i < lines.length && !lines[i].startsWith('=======')) {
-      searchLines.push(lines[i]);
+      const searchLines: string[] = [];
+      let searchStart = i + 1;
+      while (i < lines.length && lines[i].trim() !== '=======') {
+        searchLines.push(lines[i]);
+        i++;
+      }
+      if (i >= lines.length) {
+        return { edits: [], error: { code: 'parse', line: searchStart } };
+      }
+      i++; // skip =======
+
+      const replaceLines: string[] = [];
+      let replaceStart = i + 1;
+      while (i < lines.length && !lines[i].trim().startsWith('>>>>>>>')) {
+        replaceLines.push(lines[i]);
+        i++;
+      }
+      if (i >= lines.length) {
+        return { edits: [], error: { code: 'parse', line: replaceStart } };
+      }
+      const endLine = lines[i];
+      const endMatch = endLine.trim().match(/^>>>>>>>(?:\s+REPLACE)?(?:\s+(.+))?$/);
+      if (endMatch && endMatch[1]) {
+        const p = endMatch[1].trim();
+        if (p && p !== 'REPLACE') {
+          targetPath = p;
+          lastPath = p;
+        }
+      }
+      i++; // skip >>>>>>>
+
+      edits.push({
+        type: 'update',
+        path: targetPath,
+        searchLines,
+        replaceLines
+      });
+    } else {
       i++;
     }
-    if (i >= lines.length) {
-      return { edits: [], error: { code: 'parse', line: searchStartLine } };
-    }
-    i++; // skip =======
-
-    const replaceLines: string[] = [];
-    let replaceStartLine = i + 1;
-    while (i < lines.length && !lines[i].startsWith('>>>>>>>')) {
-      replaceLines.push(lines[i]);
-      i++;
-    }
-    if (i >= lines.length) {
-      return { edits: [], error: { code: 'parse', line: replaceStartLine } };
-    }
-    const endLine = lines[i];
-    // >>>>>>> REPLACE [path] or >>>>>>> [path]
-    const endMatch = endLine.match(/^>>>>>>>(?:\s+REPLACE)?(?:\s+(.+))?$/);
-    if (endMatch && endMatch[1]) {
-      const p = endMatch[1].trim();
-      if (p && p !== 'REPLACE') targetPath = p;
-    }
-    i++; // skip >>>>>>>
-
-    if (!targetPath) {
-      // look backwards or default? In standard search-replace, targetPath must be known or specified in header/footer
-      return { edits: [], error: { code: 'parse', line: searchStartLine } };
-    }
-
-    edits.push({
-      type: 'update',
-      path: targetPath,
-      searchLines,
-      replaceLines
-    });
   }
 
   if (edits.length === 0) {
@@ -360,7 +352,6 @@ function parseSearchReplace(text: string): ParseResult {
 
   return { edits };
 }
-
 function parseV4A(text: string): ParseResult {
   const lines = text.split(/\r?\n/);
   const edits: EditOperation[] = [];
