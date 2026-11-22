@@ -1127,6 +1127,22 @@ function main() {
           hasEndingNewline: v.lines?.hasEndingNewline ?? true
         };
         plannedChanges.push({ type: 'M', path: edit.path });
+      } else if (edit.chunks) {
+        // v4a
+        if (!v.lines && v.raw !== undefined) {
+          v.lines = parseFileContent(v.raw);
+        }
+        const res = applyV4AUpdate(v.lines || { lines: [], crlf: false, hasEndingNewline: false }, edit.chunks, strict);
+        if (!res.success) {
+          errorLines.push(`error: ${res.error?.code || "no-match"} ${edit.path}`);
+          continue;
+        }
+        v.lines = {
+          lines: res.lines!,
+          crlf: v.lines?.crlf ?? false,
+          hasEndingNewline: v.lines?.hasEndingNewline ?? true
+        };
+        plannedChanges.push({ type: "M", path: edit.path });
       } else {
         // search-replace
         if (!v.lines && v.raw !== undefined) {
