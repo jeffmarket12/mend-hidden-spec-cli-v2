@@ -616,10 +616,10 @@ function parseJsonPatch(text: string): ParseResult {
           if (typeof item.path !== 'string' || typeof item.file_text !== 'string') throw new Error();
           edits.push({ type: 'create', path: item.path, fileText: item.file_text });
         } else if (item.command === 'str_replace') {
-          if (typeof item.path !== 'string' || typeof item.old_str !== 'string' || item.old_str === '') throw new Error();
+          if (typeof item.path !== 'string' || typeof item.old_str !== 'string' || item.old_str === '' || (item.new_str !== undefined && typeof item.new_str !== 'string')) throw new Error();
           edits.push({ type: 'update', path: item.path, jsonCmd: 'str_replace', oldStr: item.old_str, newStr: item.new_str ?? '' });
         } else if (item.command === 'insert') {
-          if (typeof item.path !== 'string' || typeof item.insert_line !== 'number' || typeof item.new_str !== 'string') throw new Error();
+          if (typeof item.path !== 'string' || !Number.isInteger(item.insert_line) || typeof item.new_str !== 'string') throw new Error();
           edits.push({ type: 'update', path: item.path, jsonCmd: 'insert', insertLine: item.insert_line, newStr: item.new_str });
         } else throw new Error();
       }
@@ -635,10 +635,10 @@ function parseJsonPatch(text: string): ParseResult {
           if (typeof item.path !== 'string' || typeof item.file_text !== 'string') throw new Error();
           edits.push({ type: 'create', path: item.path, fileText: item.file_text });
         } else if (item.command === 'str_replace') {
-          if (typeof item.path !== 'string' || typeof item.old_str !== 'string' || item.old_str === '') throw new Error();
+          if (typeof item.path !== 'string' || typeof item.old_str !== 'string' || item.old_str === '' || (item.new_str !== undefined && typeof item.new_str !== 'string')) throw new Error();
           edits.push({ type: 'update', path: item.path, jsonCmd: 'str_replace', oldStr: item.old_str, newStr: item.new_str ?? '' });
         } else if (item.command === 'insert') {
-          if (typeof item.path !== 'string' || typeof item.insert_line !== 'number' || typeof item.new_str !== 'string') throw new Error();
+          if (typeof item.path !== 'string' || !Number.isInteger(item.insert_line) || typeof item.new_str !== 'string') throw new Error();
           edits.push({ type: 'update', path: item.path, jsonCmd: 'insert', insertLine: item.insert_line, newStr: item.new_str });
         } else throw new Error();
       } catch { return { edits: [], error: { code: 'parse', line: i + 1 } }; }
@@ -795,13 +795,15 @@ function applyUnifiedHunks(
     // Build finalN
     const finalN: string[] = [];
     if (O.length > 0) {
-      for (let i = 0; i < N.length; i++) {
-        if (N[i].type === ' ') {
-          // Context line from file
-          finalN.push(lines[matchIndex + i]);
-        } else {
-          // Non-context line (new or replaced)
-          let text = N[i].text;
+      let oIdx = 0;
+      for (const line of hunk.lines) {
+        if (line.type === ' ') {
+          finalN.push(lines[matchIndex + oIdx]);
+          oIdx++;
+        } else if (line.type === '-') {
+          oIdx++;
+        } else if (line.type === '+') {
+          let text = line.text;
           if (tier === 2) {
             const P = O[0].text.match(/^([ 	]*)/)?.[1] || '';
             const F = lines[matchIndex].match(/^([ 	]*)/)?.[1] || '';
