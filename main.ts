@@ -122,7 +122,7 @@ interface EditOperation {
   newPath?: string; // for move
   searchLines?: string[];
   replaceLines?: string[];
-  fileText?: string; // for create / json
+  fileText?: string; jsonCmd?: "str_replace" | "insert"; oldStr?: string; newStr?: string; insertLine?: number; // for create / json
   hunks?: any[]; // for unified
   chunks?: Array<{ anchor: string | null; oldLines: string[]; newLines: string[]; endOfFile: boolean }>;
 }
@@ -586,62 +586,48 @@ function parseV4A(text: string): ParseResult {
   return { edits };
 }
 function parseJsonPatch(text: string): ParseResult {
-  try {
-    const data = JSON.parse(text);
-    const rawEdits = Array.isArray(data) ? data : (data.edits || data.operations || [data]);
-    const edits: EditOperation[] = [];
-
-    for (const item of rawEdits) {
-      const type = item.type || item.op || 'update';
-      const p = item.path || item.file || item.target;
-      if (!p) {
-        return { edits: [], error: { code: 'parse', line: 1 } };
+  const trimmed = text.trim();
+  const edits: EditOperation[] = [];
+  if (trimmed.startsWith('[')) {
+    try {
+      const data = JSON.parse(trimmed);
+      if (!Array.isArray(data)) throw new Error();
+      for (const item of data) {
+        if (item.command === 'create') {
+          if (typeof item.path !== 'string' || typeof item.file_text !== 'string') throw new Error();
+          edits.push({ type: 'create', path: item.path, fileText: item.file_text });
+        } else if (item.command === 'str_replace') {
+          if (typeof item.path !== 'string' || typeof item.old_str !== 'string' || item.old_str === '') throw new Error();
+          edits.push({ type: 'update', path: item.path, jsonCmd: 'str_replace', oldStr: item.old_str, newStr: item.new_str ?? '' });
+        } else if (item.command === 'insert') {
+          if (typeof item.path !== 'string' || typeof item.insert_line !== 'number' || typeof item.new_str !== 'string') throw new Error();
+          edits.push({ type: 'update', path: item.path, jsonCmd: 'insert', insertLine: item.insert_line, newStr: item.new_str });
+        } else throw new Error();
       }
-
-      if (type === 'create') {
-        edits.push({
-          type: 'create',
-          path: p,
-          fileText: item.file_text ?? item.content ?? item.text ?? ''
-        });
-      } else if (type === 'delete') {
-        edits.push({
-          type: 'delete',
-          path: p
-        });
-      } else if (type === 'move' || type === 'rename') {
-        const oldP = item.old_path || item.old || item.from;
-        const newP = item.new_path || item.new || item.to || p;
-        edits.push({
-          type: 'move',
-          path: newP,
-          oldPath: oldP,
-          newPath: newP
-        });
-      } else {
-        // update
-        const searchLines = item.search_lines || item.search || (item.old_text ? item.old_text.split('\n') : undefined);
-        const replaceLines = item.replace_lines || item.replace || (item.new_text ? item.new_text.split('\n') : undefined);
-        edits.push({
-          type: 'update',
-          path: p,
-          searchLines: Array.isArray(searchLines) ? searchLines : (searchLines ? searchLines.split('\n') : []),
-          replaceLines: Array.isArray(replaceLines) ? replaceLines : (replaceLines ? replaceLines.split('\n') : [])
-        });
-      }
+    } catch { return { edits: [], error: { code: 'parse', line: 1 } }; }
+  } else {
+    const lines = trimmed.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        const item = JSON.parse(line);
+        if (item.command === 'create') {
+          if (typeof item.path !== 'string' || typeof item.file_text !== 'string') throw new Error();
+          edits.push({ type: 'create', path: item.path, fileText: item.file_text });
+        } else if (item.command === 'str_replace') {
+          if (typeof item.path !== 'string' || typeof item.old_str !== 'string' || item.old_str === '') throw new Error();
+          edits.push({ type: 'update', path: item.path, jsonCmd: 'str_replace', oldStr: item.old_str, newStr: item.new_str ?? '' });
+        } else if (item.command === 'insert') {
+          if (typeof item.path !== 'string' || typeof item.insert_line !== 'number' || typeof item.new_str !== 'string') throw new Error();
+          edits.push({ type: 'update', path: item.path, jsonCmd: 'insert', insertLine: item.insert_line, newStr: item.new_str });
+        } else throw new Error();
+      } catch { return { edits: [], error: { code: 'parse', line: i + 1 } }; }
     }
-
-    if (edits.length === 0) {
-      return { edits: [], error: { code: 'parse', line: 1 } };
-    }
-
-    return { edits };
-  } catch (err: any) {
-    return { edits: [], error: { code: 'parse', line: 1 } };
   }
+  return edits.length ? { edits } : { edits: [], error: { code: 'parse', line: 1 } };
 }
 
-// --- Matching Engine ---
 
 function getIndent(line: string): string {
   const m = line.match(/^([ \t]*)/);
@@ -1130,9 +1116,32 @@ function main() {
         errorLines.push(`error: missing ${edit.path}`);
         continue;
       }
-      if (edit.hunks) {
+      if (edit.jsonCmd === 'str_replace') {
+        const isCrlf = v.raw?.includes('\r\n') ?? false;
+        let text = v.raw?.replace(/\r\n/g, '\n') ?? '';
+        const oldStr = edit.oldStr?.replace(/\r\n/g, '\n') ?? '';
+        const newStr = edit.newStr?.replace(/\r\n/g, '\n') ?? '';
+        let count = 0, pos = -1;
+        while ((pos = text.indexOf(oldStr, pos + 1)) !== -1) count++;
+        if (count === 0) { errorLines.push(`error: no-match ${edit.path}`); continue; }
+        if (count > 1) { errorLines.push(`error: ambiguous ${edit.path}`); continue; }
+        text = text.replace(oldStr, newStr);
+        if (isCrlf) text = text.replace(/\n/g, '\r\n');
+        v.raw = text;
+        v.lines = undefined;
+        plannedChanges.push({ type: 'M', path: edit.path });
+      } else if (edit.jsonCmd === 'insert') {
+        if (!v.lines) v.lines = parseFileContent(v.raw ?? '');
+        const lines = v.lines.lines;
+        if (edit.insertLine! < 0 || edit.insertLine! > lines.length) { errorLines.push(`error: no-match ${edit.path}`); continue; }
+        const newLines = edit.newStr!.split('\n').map(l => l.replace(/\r$/, ''));
+        if (newLines.length > 0 && (edit.newStr === '' || edit.newStr.endsWith('\n'))) newLines.pop();
+        lines.splice(edit.insertLine!, 0, ...newLines);
+        v.lines.lines = lines;
+        v.raw = undefined;
+        plannedChanges.push({ type: 'M', path: edit.path });
+      } else if (edit.hunks) {
         // unified
-        // parse lines if not parsed
         if (!v.lines && v.raw !== undefined) {
           v.lines = parseFileContent(v.raw);
         }
