@@ -154,8 +154,12 @@ function detectFormat(text: string): PatchFormat | null {
       return 'v4a';
     }
   }
-  for (const line of lines) {
-    if (line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('@@ ')) {
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.startsWith('diff --git ')) {
+      return 'unified';
+    }
+    if (line.startsWith('--- ') && i + 1 < lines.length && lines[i + 1].startsWith('+++ ')) {
       return 'unified';
     }
   }
