@@ -632,184 +632,295 @@ function applyHunks(content: string, hunks: { o: string[]; n: string[]; hasEol: 
 }
 
 function runEdits(ops: EditOp[], strict: boolean): ExecutionResult {
-  const files = new Map<string, string>();
-  function scanDir(dir: string, base: string) {
-    if (!fs.existsSync(dir)) return;
-    for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (ent.name === '.git' || ent.name === '.makefun') continue;
-      const rel = base ? `${base}/${ent.name}` : ent.name;
-      const full = path.join(dir, ent.name);
-      if (ent.isDirectory()) scanDir(full, rel);
-      else if (ent.isFile()) { try { files.set(rel, fs.readFileSync(full, 'utf8')); } catch (e) {} }
+  const repositoryFiles = new Map<string, string>();
+  function populateTree(currentDir: string, relativeBase: string) {
+    if (!fs.existsSync(currentDir)) return;
+    for (const directoryEntry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+      if (directoryEntry.name === '.git' || directoryEntry.name === '.makefun') continue;
+      const relPath = relativeBase ? `${relativeBase}/${directoryEntry.name}` : directoryEntry.name;
+      const fullPath = path.join(currentDir, directoryEntry.name);
+      if (directoryEntry.isDirectory()) {
+        populateTree(fullPath, relPath);
+      } else if (directoryEntry.isFile()) {
+        try {
+          repositoryFiles.set(relPath, fs.readFileSync(fullPath, 'utf8'));
+        } catch (err) {}
+      }
     }
   }
-  scanDir('.', '');
-  const fileChanges = new Map<string, any>();
-  const errorLines: string[] = [];
-  
-  for (const op of ops) {
-    if (!isSafePath(op.path)) { errorLines.push(`unsafe ${op.path}`); continue; }
-    if (op.newPath && !isSafePath(op.newPath)) { errorLines.push(`unsafe ${op.newPath}`); continue; }
-    if (op.type === 'create') {
-      if (files.has(op.path)) { errorLines.push(`exists ${op.path}`); continue; }
-      let newText = op.fileText ?? (op.content ? op.content.join('\n') + (op.content.length > 0 ? '\n' : '') : (op.hunks ? op.hunks.map(h=>h.n.join('\n')+(h.hasEol && h.n.length > 0 ? '\n' : '')).join('') : ''));
-      files.set(op.path, newText); fileChanges.set(op.path, { type: 'A', content: newText });
-    } else if (op.type === 'delete') {
-      if (!files.has(op.path)) { errorLines.push(`missing ${op.path}`); continue; }
-      files.delete(op.path); fileChanges.set(op.path, { type: 'D' });
-    } else if (op.type === 'rename') {
-      if (!files.has(op.path)) { errorLines.push(`missing ${op.path}`); continue; }
-      if (files.has(op.newPath!)) { errorLines.push(`exists ${op.newPath!}`); continue; }
-      let content = files.get(op.path)!;
-      // A rename may carry content changes (unified hunks or V4A chunks) — apply
-      // them to the content before moving it to the new path.
-      if (op.hunks && op.hunks.length > 0) {
-        const r = applyHunks(content, op.hunks, strict);
-        if (!r.ok) { errorLines.push(`${r.reason} ${op.path}`); continue; }
-        content = r.content;
-      } else if (op.chunks && op.chunks.length > 0) {
-        const r = applyChunks(content, op.chunks, strict);
-        if (!r.ok) { errorLines.push(`${r.reason} ${op.path}`); continue; }
-        content = r.content;
+  populateTree('.', '');
+
+  const modifiedChanges = new Map<string, any>();
+  const reportedErrors: string[] = [];
+
+  for (const singleOp of ops) {
+    if (!isSafePath(singleOp.path)) {
+      reportedErrors.push(`unsafe ${singleOp.path}`);
+      continue;
+    }
+    if (singleOp.newPath && !isSafePath(singleOp.newPath)) {
+      reportedErrors.push(`unsafe ${singleOp.newPath}`);
+      continue;
+    }
+
+    if (singleOp.type === 'create') {
+      if (repositoryFiles.has(singleOp.path)) {
+        reportedErrors.push(`exists ${singleOp.path}`);
+        continue;
       }
-      files.delete(op.path); files.set(op.newPath!, content);
-      fileChanges.set(op.newPath!, { type: 'R', oldPath: op.path, newPath: op.newPath, content });
-      fileChanges.delete(op.path);
-    } else if (op.type === 'update') {
-      if (!files.has(op.path)) { errorLines.push(`missing ${op.path}`); continue; }
-      let content = files.get(op.path)!;
-      if (op.oldStr !== undefined) {
-        const isCrlf = content.includes('\r\n');
-        let textNorm = isCrlf ? content.replace(/\r\n/g, '\n') : content;
-        const oldNorm = op.oldStr.replace(/\r\n/g, '\n'), newNorm = op.newStr!.replace(/\r\n/g, '\n');
-        let count = 0, pos = textNorm.indexOf(oldNorm);
-        while (pos !== -1) { count++; pos = textNorm.indexOf(oldNorm, pos + 1); }
-        if (count === 0) { errorLines.push(`no-match ${op.path}`); continue; }
-        if (count > 1) { errorLines.push(`ambiguous ${op.path}`); continue; }
-        textNorm = textNorm.replace(oldNorm, newNorm);
-        content = isCrlf ? textNorm.replace(/\n/g, '\r\n') : textNorm;
-        files.set(op.path, content); fileChanges.set(op.path, { type: 'M', content });
-      } else if (op.insertLine !== undefined) {
-        const fc = parseFile(content);
-        if (op.insertLine < 0 || op.insertLine > fc.lines.length) { errorLines.push(`no-match ${op.path}`); continue; }
-        const insertStrs = op.newStr.split('\n').map(l => l.replace(/\r$/, ''));
-        if (op.newStr.endsWith('\n') && insertStrs.length > 0 && insertStrs[insertStrs.length - 1] === '') insertStrs.pop();
-        if (op.newStr === '') insertStrs.length = 0;
-        fc.lines.splice(op.insertLine, 0, ...insertStrs);
-        content = serializeFile(fc);
-        files.set(op.path, content); fileChanges.set(op.path, { type: 'M', content });
-      } else if (op.chunks) {
-        const fc = parseFile(content);
-        let cursor = 0, failed = false, failReason = '';
-        for (const chunk of op.chunks) {
-          if (chunk.isEof) {
-            if (chunk.anchor) {
-              const matches = locateGrade0(fc.lines, [chunk.anchor]);
-              let matchIdx = -1;
-              for (const m of matches) { if (m + 1 === fc.lines.length) { matchIdx = m; break; } }
-              if (matchIdx === -1) { const t1 = locateGrade1(fc.lines, [chunk.anchor]); for (const m of t1) { if (m + 1 === fc.lines.length) { matchIdx = m; break; } } }
-              if (matchIdx === -1) { const t2 = locateGrade2(fc.lines, [chunk.anchor]); for (const m of t2) { if (m + 1 === fc.lines.length) { matchIdx = m; break; } } }
-              if (matchIdx === -1) { failed = true; failReason = 'no-match'; break; }
-              cursor = matchIdx + 1;
-              // The anchor is the file's last line, so o-lines after it cannot match.
-              if (chunk.o.length > 0) { failed = true; failReason = 'no-match'; break; }
-              fc.lines.splice(cursor, 0, ...chunk.n); cursor += chunk.n.length;
-              continue;
-            }
-            // No anchor: the o-lines must match the file's FINAL lines.
-            if (chunk.o.length === 0) {
-              cursor = fc.lines.length;
-              fc.lines.splice(cursor, 0, ...chunk.n); cursor += chunk.n.length;
-              continue;
-            }
-            let eofIdx = -1, eofTier = -1;
-            for (const t of (strict ? [0] : [0, 1, 2])) {
-              const fn = t === 0 ? locateGrade0 : t === 1 ? locateGrade1 : locateGrade2;
-              for (const m of fn(fc.lines, chunk.o)) {
-                if (m + chunk.o.length === fc.lines.length) { eofIdx = m; eofTier = t; break; }
-              }
-              if (eofIdx !== -1) break;
-            }
-            if (eofIdx === -1) { failed = true; failReason = 'no-match'; break; }
-            const transN = buildReplacement(chunk, fc.lines.slice(eofIdx, eofIdx + chunk.o.length), eofTier);
-            fc.lines.splice(eofIdx, chunk.o.length, ...transN);
-            cursor = eofIdx + transN.length;
-            continue;
-          }
-          if (chunk.anchor) {
-            let foundMatch: { index: number; tier: number } | null = null;
-            for (const t of (strict ? [0] : [0, 1, 2])) {
-              const fn = t === 0 ? locateGrade0 : t === 1 ? locateGrade1 : locateGrade2;
-              const matches = fn(fc.lines.slice(cursor), [chunk.anchor]);
-              if (matches.length > 0) { foundMatch = { index: cursor + matches[0], tier: t }; break; }
-            }
-            if (!foundMatch) { failed = true; failReason = 'no-match'; break; }
-            cursor = foundMatch.index + 1;
-          }
-          if (chunk.o.length > 0) {
-             const occ = locateInstance(fc.lines.slice(cursor), chunk.o, strict);
-             if (!occ) { failed = true; failReason = 'no-match'; break; }
-             const absIndex = cursor + occ.index;
-             const transN = buildReplacement(chunk, fc.lines.slice(absIndex, absIndex + chunk.o.length), occ.tier);
-             fc.lines.splice(absIndex, chunk.o.length, ...transN);
-             cursor = absIndex + transN.length;
-          } else { fc.lines.splice(cursor, 0, ...chunk.n); cursor += chunk.n.length; }
+      let generatedContent = singleOp.fileText ?? (
+        singleOp.content ? singleOp.content.join('\n') + (singleOp.content.length > 0 ? '\n' : '') : (
+          singleOp.hunks ? singleOp.hunks.map(h => h.n.join('\n') + (h.hasEol && h.n.length > 0 ? '\n' : '')).join('') : ''
+        )
+      );
+      repositoryFiles.set(singleOp.path, generatedContent);
+      modifiedChanges.set(singleOp.path, { type: 'A', content: generatedContent });
+    } else if (singleOp.type === 'delete') {
+      if (!repositoryFiles.has(singleOp.path)) {
+        reportedErrors.push(`missing ${singleOp.path}`);
+        continue;
+      }
+      repositoryFiles.delete(singleOp.path);
+      modifiedChanges.set(singleOp.path, { type: 'D' });
+    } else if (singleOp.type === 'rename') {
+      if (!repositoryFiles.has(singleOp.path)) {
+        reportedErrors.push(`missing ${singleOp.path}`);
+        continue;
+      }
+      if (repositoryFiles.has(singleOp.newPath!)) {
+        reportedErrors.push(`exists ${singleOp.newPath!}`);
+        continue;
+      }
+      let filePayload = repositoryFiles.get(singleOp.path)!;
+      if (singleOp.hunks && singleOp.hunks.length > 0) {
+        const outcome = applyHunks(filePayload, singleOp.hunks, strict);
+        if (!outcome.ok) {
+          reportedErrors.push(`${outcome.reason} ${singleOp.path}`);
+          continue;
         }
-        if (failed) { errorLines.push(`${failReason} ${op.path}`); continue; }
-        content = serializeFile(fc); files.set(op.path, content); fileChanges.set(op.path, { type: 'M', content });
-      } else if (op.hunks) {
-        const fc = parseFile(content);
-        let hunkSumD = 0, failed = false, failReason = '';
-        for (const hunk of op.hunks) {
-          const oLines = hunk.o.map(l => l.startsWith(' ') ? l.slice(1) : l.startsWith('-') ? l.slice(1) : l); // fix trailing space/prefix issue: actually strip ONE space if it's a context line
-          // Actually, simply remove first char if it was a context/old line
-          const oLinesCleaned = hunk.o;
-          const nLinesCleaned = hunk.n;
-          // Spec: "A context line... is written as the file's own matched line, never the patch's."
-          // So if we have -old, we look for old. If we have +new, we write new.
-          // The current implementation splits lines into oLines and nLines, which already strips the prefix. This looks okay.
-          
-          if (oLinesCleaned.length === 0) {
-            const insertPos = Math.min(fc.lines.length, (hunk.a ?? 0) + hunkSumD);
-            fc.lines.splice(insertPos, 0, ...nLinesCleaned);
-            if (!hunk.hasEol) fc.hasEol = false;
-            hunkSumD += nLinesCleaned.length - oLinesCleaned.length;
+        filePayload = outcome.content;
+      } else if (singleOp.chunks && singleOp.chunks.length > 0) {
+        const outcome = applyChunks(filePayload, singleOp.chunks, strict);
+        if (!outcome.ok) {
+          reportedErrors.push(`${outcome.reason} ${singleOp.path}`);
+          continue;
+        }
+        filePayload = outcome.content;
+      }
+      repositoryFiles.delete(singleOp.path);
+      repositoryFiles.set(singleOp.newPath!, filePayload);
+      modifiedChanges.set(singleOp.newPath!, { type: 'R', oldPath: singleOp.path, newPath: singleOp.newPath, content: filePayload });
+      modifiedChanges.delete(singleOp.path);
+    } else if (singleOp.type === 'update') {
+      if (!repositoryFiles.has(singleOp.path)) {
+        reportedErrors.push(`missing ${singleOp.path}`);
+        continue;
+      }
+      let filePayload = repositoryFiles.get(singleOp.path)!;
+
+      if (singleOp.oldStr !== undefined) {
+        const isWindowsCrLf = filePayload.includes('\r\n');
+        let normalizedText = isWindowsCrLf ? filePayload.replace(/\r\n/g, '\n') : filePayload;
+        const normalizedOld = singleOp.oldStr.replace(/\r\n/g, '\n');
+        const normalizedNew = singleOp.newStr!.replace(/\r\n/g, '\n');
+        let matchCount = 0, searchIndex = normalizedText.indexOf(normalizedOld);
+        while (searchIndex !== -1) {
+          matchCount++;
+          searchIndex = normalizedText.indexOf(normalizedOld, searchIndex + 1);
+        }
+        if (matchCount === 0) {
+          reportedErrors.push(`no-match ${singleOp.path}`);
+          continue;
+        }
+        if (matchCount > 1) {
+          reportedErrors.push(`ambiguous ${singleOp.path}`);
+          continue;
+        }
+        normalizedText = normalizedText.replace(normalizedOld, normalizedNew);
+        filePayload = isWindowsCrLf ? normalizedText.replace(/\n/g, '\r\n') : normalizedText;
+        repositoryFiles.set(singleOp.path, filePayload);
+        modifiedChanges.set(singleOp.path, { type: 'M', content: filePayload });
+      } else if (singleOp.insertLine !== undefined) {
+        const parsedDoc = parseFile(filePayload);
+        if (singleOp.insertLine < 0 || singleOp.insertLine > parsedDoc.lines.length) {
+          reportedErrors.push(`no-match ${singleOp.path}`);
+          continue;
+        }
+        const insertRows = singleOp.newStr.split('\n').map(l => l.replace(/\r$/, ''));
+        if (singleOp.newStr.endsWith('\n') && insertRows.length > 0 && insertRows[insertRows.length - 1] === '') {
+          insertRows.pop();
+        }
+        if (singleOp.newStr === '') {
+          insertRows.length = 0;
+        }
+        parsedDoc.lines.splice(singleOp.insertLine, 0, ...insertRows);
+        filePayload = serializeFile(parsedDoc);
+        repositoryFiles.set(singleOp.path, filePayload);
+        modifiedChanges.set(singleOp.path, { type: 'M', content: filePayload });
+      } else if (singleOp.chunks) {
+        const parsedDoc = parseFile(filePayload);
+        let currentOffset = 0, hasFailed = false, failReasonTag = '';
+        for (const itemChunk of singleOp.chunks) {
+          if (itemChunk.isEof) {
+            if (itemChunk.anchor) {
+              const matchesGrade0 = locateGrade0(parsedDoc.lines, [itemChunk.anchor]);
+              let matchedIndex = -1;
+              for (const idxVal of matchesGrade0) {
+                if (idxVal + 1 === parsedDoc.lines.length) { matchedIndex = idxVal; break; }
+              }
+              if (matchedIndex === -1) {
+                const matchesGrade1 = locateGrade1(parsedDoc.lines, [itemChunk.anchor]);
+                for (const idxVal of matchesGrade1) {
+                  if (idxVal + 1 === parsedDoc.lines.length) { matchedIndex = idxVal; break; }
+                }
+              }
+              if (matchedIndex === -1) {
+                const matchesGrade2 = locateGrade2(parsedDoc.lines, [itemChunk.anchor]);
+                for (const idxVal of matchesGrade2) {
+                  if (idxVal + 1 === parsedDoc.lines.length) { matchedIndex = idxVal; break; }
+                }
+              }
+              if (matchedIndex === -1) {
+                hasFailed = true;
+                failReasonTag = 'no-match';
+                break;
+              }
+              currentOffset = matchedIndex;
+            } else {
+              let eofMatchIndex = -1, eofMatchTier = 0;
+              for (const tierLevel of (strict ? [0] : [0, 1, 2])) {
+                const lookupFn = tierLevel === 0 ? locateGrade0 : tierLevel === 1 ? locateGrade1 : locateGrade2;
+                const foundIndices = lookupFn(parsedDoc.lines, itemChunk.o);
+                for (const idxVal of foundIndices) {
+                  if (idxVal + itemChunk.o.length === parsedDoc.lines.length) {
+                    eofMatchIndex = idxVal;
+                    eofMatchTier = tierLevel;
+                    break;
+                  }
+                }
+                if (eofMatchIndex !== -1) break;
+              }
+              if (eofMatchIndex === -1) {
+                hasFailed = true;
+                failReasonTag = 'no-match';
+                break;
+              }
+              const replacementLines = buildReplacement(itemChunk, parsedDoc.lines.slice(eofMatchIndex, eofMatchIndex + itemChunk.o.length), eofMatchTier);
+              parsedDoc.lines.splice(eofMatchIndex, itemChunk.o.length, ...replacementLines);
+              currentOffset = eofMatchIndex + replacementLines.length;
+              continue;
+            }
+          }
+
+          if (itemChunk.anchor) {
+            let locatedAnchor: { index: number; tier: number } | null = null;
+            for (const tierLevel of (strict ? [0] : [0, 1, 2])) {
+              const lookupFn = tierLevel === 0 ? locateGrade0 : tierLevel === 1 ? locateGrade1 : locateGrade2;
+              const subMatches = lookupFn(parsedDoc.lines.slice(currentOffset), [itemChunk.anchor]);
+              if (subMatches.length > 0) {
+                locatedAnchor = { index: currentOffset + subMatches[0], tier: tierLevel };
+                break;
+              }
+            }
+            if (!locatedAnchor) {
+              hasFailed = true;
+              failReasonTag = 'no-match';
+              break;
+            }
+            currentOffset = locatedAnchor.index + 1;
+          }
+
+          if (itemChunk.o.length > 0) {
+            const occurrenceInfo = locateInstance(parsedDoc.lines.slice(currentOffset), itemChunk.o, strict);
+            if (!occurrenceInfo) {
+              hasFailed = true;
+              failReasonTag = 'no-match';
+              break;
+            }
+            const absoluteLoc = currentOffset + occurrenceInfo.index;
+            const replacementLines = buildReplacement(itemChunk, parsedDoc.lines.slice(absoluteLoc, absoluteLoc + itemChunk.o.length), occurrenceInfo.tier);
+            parsedDoc.lines.splice(absoluteLoc, itemChunk.o.length, ...replacementLines);
+            currentOffset = absoluteLoc + replacementLines.length;
           } else {
-            let matches: { index: number; tier: number }[] = [];
-            const fn = (t: number) => t === 0 ? locateGrade0 : t === 1 ? locateGrade1 : locateGrade2;
-            for (const t of (strict ? [0] : [0, 1, 2])) {
-              const res = fn(t)(fc.lines, oLinesCleaned);
-              if (res.length > 0) { matches = res.map(idx => ({ index: idx, tier: t })); break; }
-            }
-            if (matches.length === 0) { failed = true; failReason = 'no-match'; break; }
-            const isSearchReplaceBlock = hunk.a === undefined;
-            if (isSearchReplaceBlock && matches.length > 1) {
-              const firstTier = matches[0].tier;
-              const sameTierMatches = matches.filter(m => m.tier === firstTier);
-              if (sameTierMatches.length > 1) { failed = true; failReason = 'ambiguous'; break; }
-              matches = [sameTierMatches[0]];
-            }
-            let bestMatch = matches[0];
-            if (hunk.a !== undefined) {
-              const targetPos = hunk.a - 1 + hunkSumD;
-              let minDist = Math.abs(bestMatch.index - targetPos);
-              for (let mi = 1; mi < matches.length; mi++) {
-                const dist = Math.abs(matches[mi].index - targetPos);
-                if (dist < minDist) { minDist = dist; bestMatch = matches[mi]; }
-              }
-            }
-            const transN = buildReplacement(hunk, fc.lines.slice(bestMatch.index, bestMatch.index + oLinesCleaned.length), bestMatch.tier);
-            fc.lines.splice(bestMatch.index, oLinesCleaned.length, ...transN);
-            if (!hunk.hasEol) fc.hasEol = false;
-            hunkSumD += transN.length - oLinesCleaned.length;
+            parsedDoc.lines.splice(currentOffset, 0, ...itemChunk.n);
+            currentOffset += itemChunk.n.length;
           }
         }
-        if (failed) { errorLines.push(`${failReason || 'no-match'} ${op.path}`); continue; }
-        content = serializeFile(fc); files.set(op.path, content); fileChanges.set(op.path, { type: 'M', content });
+
+        if (hasFailed) {
+          reportedErrors.push(`${failReasonTag} ${singleOp.path}`);
+          continue;
+        }
+        filePayload = serializeFile(parsedDoc);
+        repositoryFiles.set(singleOp.path, filePayload);
+        modifiedChanges.set(singleOp.path, { type: 'M', content: filePayload });
+      } else if (singleOp.hunks) {
+        const parsedDoc = parseFile(filePayload);
+        let cumulativeDelta = 0, hasFailed = false, failReasonTag = '';
+        for (const itemHunk of singleOp.hunks) {
+          const cleanOldLines = itemHunk.o;
+          const cleanNewLines = itemHunk.n;
+
+          if (cleanOldLines.length === 0) {
+            const insertionIndex = Math.min(parsedDoc.lines.length, (itemHunk.a ?? 0) + cumulativeDelta);
+            parsedDoc.lines.splice(insertionIndex, 0, ...cleanNewLines);
+            if (!itemHunk.hasEol) parsedDoc.hasEol = false;
+            cumulativeDelta += cleanNewLines.length - cleanOldLines.length;
+          } else {
+            let matchedList: { index: number; tier: number }[] = [];
+            const selectLookup = (t: number) => t === 0 ? locateGrade0 : t === 1 ? locateGrade1 : locateGrade2;
+            for (const tierLevel of (strict ? [0] : [0, 1, 2])) {
+              const resArr = selectLookup(tierLevel)(parsedDoc.lines, cleanOldLines);
+              if (resArr.length > 0) {
+                matchedList = resArr.map(idxVal => ({ index: idxVal, tier: tierLevel }));
+                break;
+              }
+            }
+            if (matchedList.length === 0) {
+              hasFailed = true;
+              failReasonTag = 'no-match';
+              break;
+            }
+            const isSearchReplaceBlock = itemHunk.a === undefined;
+            if (isSearchReplaceBlock && matchedList.length > 1) {
+              const firstTierLevel = matchedList[0].tier;
+              const sameTierList = matchedList.filter(m => m.tier === firstTierLevel);
+              if (sameTierList.length > 1) {
+                hasFailed = true;
+                failReasonTag = 'ambiguous';
+                break;
+              }
+              matchedList = [sameTierList[0]];
+            }
+            let chosenMatch = matchedList[0];
+            if (itemHunk.a !== undefined) {
+              const expectedAnchorPos = itemHunk.a - 1 + cumulativeDelta;
+              let shortestDist = Math.abs(chosenMatch.index - expectedAnchorPos);
+              for (let idxVal = 1; idxVal < matchedList.length; idxVal++) {
+                const calculatedDist = Math.abs(matchedList[idxVal].index - expectedAnchorPos);
+                if (calculatedDist < shortestDist) {
+                  shortestDist = calculatedDist;
+                  chosenMatch = matchedList[idxVal];
+                }
+              }
+            }
+            const replacementLines = buildReplacement(itemHunk, parsedDoc.lines.slice(chosenMatch.index, chosenMatch.index + cleanOldLines.length), chosenMatch.tier);
+            parsedDoc.lines.splice(chosenMatch.index, cleanOldLines.length, ...replacementLines);
+            if (!itemHunk.hasEol) parsedDoc.hasEol = false;
+            cumulativeDelta += replacementLines.length - cleanOldLines.length;
+          }
+        }
+        if (hasFailed) {
+          reportedErrors.push(`${failReasonTag || 'no-match'} ${singleOp.path}`);
+          continue;
+        }
+        filePayload = serializeFile(parsedDoc);
+        repositoryFiles.set(singleOp.path, filePayload);
+        modifiedChanges.set(singleOp.path, { type: 'M', content: filePayload });
       }
     }
   }
-  return { success: errorLines.length === 0, fileChanges, errorLines };
+  return { success: reportedErrors.length === 0, fileChanges: modifiedChanges, errorLines: reportedErrors };
 }
 
 async function main() {
