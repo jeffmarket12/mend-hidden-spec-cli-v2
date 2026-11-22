@@ -136,12 +136,11 @@ interface ApplyResult {
 // --- Patch Format Detection & Unified Diff Parser ---
 
 function detectFormat(text: string): PatchFormat | null {
-  const trimmed = text.trim();
-  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
-    try {
-      JSON.parse(text);
-      return 'json';
-    } catch {}
+  const detLines = text.split(/\r?\n/);
+  const firstNonBlank = detLines.find(l => l.trim() !== "");
+  if (firstNonBlank) {
+    const firstChar = firstNonBlank.trim()[0];
+    if (firstChar === "[" || firstChar === "{") return "json";
   }
   const lines = text.split(/\r?\n/);
   for (const line of lines) {
@@ -350,8 +349,12 @@ function parseSearchReplace(text: string): ParseResult {
       }
       i++; // skip >>>>>>>
 
-      edits.push({
-        type: 'update',
+      edits.push(searchLines.length === 0 ? {
+        type: "create",
+        path: targetPath,
+        fileText: replaceLines.join("\n") + (replaceLines.length > 0 ? "\n" : "")
+      } : {
+        type: "update",
         path: targetPath,
         searchLines,
         replaceLines
