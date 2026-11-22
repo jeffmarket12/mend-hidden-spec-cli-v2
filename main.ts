@@ -620,3 +620,98 @@ function matchSearchBlock(
 
   return { index: -1, tier: -1, count: 0 };
 }
+
+// --- Apply Logic & Execution ---
+
+function applyUnifiedHunks(fileLines: FileLines, hunks: any[], strict: boolean): { success: boolean; lines?: string[]; error?: { code: string } } {
+  let lines = [...fileLines.lines];
+  // Process hunks from bottom to top so line numbers remain stable
+  const sortedHunks = [...hunks].sort((a, b) => b.oldStart - a.oldStart);
+
+  for (const hunk of sortedHunks) {
+    const searchLines: string[] = [];
+    const replaceLines: string[] = [];
+    for (const hl of hunk.lines) {
+      if (hl.type === ' ' || hl.type === '-') {
+        searchLines.push(hl.text);
+      }
+      if (hl.type === ' ' || hl.type === '+') {
+        replaceLines.push(hl.text);
+      }
+    }
+
+    const hint = hunk.oldStart - 1;
+    const match = matchSearchBlock(lines, searchLines, hint, strict);
+    if (match.index === -1) {
+      return { success: false, error: { code: 'no-match' } };
+    }
+    if (match.count > 1) {
+      // Check if hint distinguishes or if it's ambiguous
+      // In unified diffs, if multiple matches, check if hint matches exact oldStart
+      if (hint >= 0 && hint < lines.length) {
+        // verify exact match at hint
+        let exactAtHint = true;
+        for (let j = 0; j < searchLines.length; j++) {
+          if (lines[hint + j] !== searchLines[j]) {
+            exactAtHint = false;
+            break;
+          }
+        }
+        if (!exactAtHint) {
+          return { success: false, error: { code: 'ambiguous' } };
+        }
+        lines.splice(hint, searchLines.length, ...replaceLines);
+        continue;
+      }
+      return { success: false, error: { code: 'ambiguous' } };
+    }
+
+    // Apply replacement at match.index
+    // If tier 2 (indent-insensitive), re-indent replaceLines relative to file indentation
+    let finalReplace = replaceLines;
+    if (match.tier === 2 && searchLines.length > 0) {
+      const fileIndent = getIndent(lines[match.index]);
+      const searchIndent = getIndent(searchLines[0]);
+      if (fileIndent !== searchIndent) {
+        finalReplace = replaceLines.map((rLine) => {
+          if (rLine.trim() === '') return rLine;
+          const rIndent = getIndent(rLine);
+          // adjust rLine indentation
+          const stripped = stripIndent(rLine);
+          return fileIndent + stripped;
+        });
+      }
+    }
+
+    lines.splice(match.index, searchLines.length, ...finalReplace);
+  }
+
+  return { success: true, lines };
+}
+
+function applySearchReplaceEdit(fileLines: FileLines, searchLines: string[], replaceLines: string[], strict: boolean): { success: boolean; lines?: string[]; error?: { code: string } } {
+  const match = matchSearchBlock(fileLines.lines, searchLines, -1, strict);
+  if (match.index === -1) {
+    return { success: false, error: { code: 'no-match' } };
+  }
+  if (match.count > 1) {
+    return { success: false, error: { code: 'ambiguous' } };
+  }
+
+  let finalReplace = replaceLines;
+  if (match.tier === 2 && searchLines.length > 0) {
+    const fileIndent = getIndent(fileLines.lines[match.index]);
+    const searchIndent = getIndent(searchLines[0]);
+    if (fileIndent !== searchIndent) {
+      finalReplace = replaceLines.map((rLine) => {
+        if (rLine.trim() === '') return rLine;
+        const stripped = stripIndent(rLine);
+        return fileIndent + stripped;
+      });
+    }
+  }
+
+  const newLines = [...fileLines.lines];
+  newLines.splice(match.index, searchLines.length, ...finalReplace);
+  return { success: true, lines: newLines };
+}
