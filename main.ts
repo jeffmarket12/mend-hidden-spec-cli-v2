@@ -131,3 +131,141 @@ interface ApplyResult {
   errorCode?: 'no-match' | 'ambiguous' | 'missing' | 'exists' | 'unsafe';
   errorPath?: string;
 }
+
+// --- Patch Format Detection & Unified Diff Parser ---
+
+function detectFormat(text: string): PatchFormat | null {
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+    try {
+      JSON.parse(text);
+      return 'json';
+    } catch {}
+  }
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    if (line.startsWith('<<<<<<< SEARCH') || line.startsWith('<<<<<<<') || line.startsWith('<<<<<<< REPLACE')) {
+      return 'search-replace';
+    }
+  }
+  for (const line of lines) {
+    if (line.startsWith('=== file:') || line.startsWith('=== create:') || line.startsWith('=== delete:') || line.startsWith('=== move:')) {
+      return 'v4a';
+    }
+  }
+  for (const line of lines) {
+    if (line.startsWith('--- ') || line.startsWith('+++ ') || line.startsWith('@@ ')) {
+      return 'unified';
+    }
+  }
+  return null;
+}
+
+interface ParseResult {
+  edits: EditOperation[];
+  error?: { code: string; line: number };
+}
+
+function parseUnifiedDiff(text: string): ParseResult {
+  const lines = text.split(/\r?\n/);
+  const edits: EditOperation[] = [];
+  let i = 0;
+  let currentFile: string | null = null;
+  let currentHunks: any[] = [];
+  let curHunk: any = null;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line === '' || line.startsWith('#')) {
+      i++;
+      continue;
+    }
+    if (line.startsWith('--- ')) {
+      if (curHunk) {
+        currentHunks.push(curHunk);
+        curHunk = null;
+      }
+      if (currentFile && currentHunks.length > 0) {
+        edits.push({ type: 'update', path: currentFile, hunks: currentHunks });
+        currentHunks = [];
+      }
+      // parse target file path
+      const pathPart = line.slice(4).trim();
+      // remove timestamp or tab
+      const cleanPath = pathPart.split('\t')[0].trim();
+      let targetPath = cleanPath;
+      if (cleanPath.startsWith('a/') || cleanPath.startsWith('b/')) {
+        targetPath = cleanPath.slice(2);
+      }
+      currentFile = targetPath;
+      i++;
+      if (i < lines.length && lines[i].startsWith('+++ ')) {
+        const plusPart = lines[i].slice(4).trim();
+        const cleanPlus = plusPart.split('\t')[0].trim();
+        if (!cleanPlus.startsWith('/dev/null') && cleanPlus !== '/dev/null') {
+          let p2 = cleanPlus;
+          if (p2.startsWith('a/') || p2.startsWith('b/')) p2 = p2.slice(2);
+          if (p2 !== '' && p2 !== '/dev/null') currentFile = p2;
+        }
+        i++;
+      }
+      continue;
+    }
+
+    if (line.startsWith('@@ ')) {
+      if (curHunk) {
+        currentHunks.push(curHunk);
+      }
+      // parse hunk header @@ -l,s +l,s @@
+      const m = line.match(/^@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s+@@(.*)$/);
+      if (!m) {
+        return { edits: [], error: { code: 'parse', line: i + 1 } };
+      }
+      curHunk = {
+        oldStart: parseInt(m[1], 10),
+        newStart: parseInt(m[2], 10),
+        lines: []
+      };
+      i++;
+      continue;
+    }
+
+    if (curHunk) {
+      if (line.startsWith(' ') || line.startsWith('+') || line.startsWith('-')) {
+        curHunk.lines.push({
+          type: line[0],
+          text: line.slice(1)
+        });
+        i++;
+        continue;
+      } else {
+        // blank or invalid line in hunk
+        if (line.trim() === '') {
+          curHunk.lines.push({ type: ' ', text: '' });
+          i++;
+          continue;
+        }
+        // If it starts with diff headers or something else, close hunk
+        currentHunks.push(curHunk);
+        curHunk = null;
+        continue;
+      }
+    }
+
+    // If we see lines outside hunks that aren't file headers, parse error or skip
+    i++;
+  }
+
+  if (curHunk) {
+    currentHunks.push(curHunk);
+  }
+  if (currentFile && currentHunks.length > 0) {
+    edits.push({ type: 'update', path: currentFile, hunks: currentHunks });
+  }
+
+  if (edits.length === 0) {
+    return { edits: [], error: { code: 'parse', line: 1 } };
+  }
+
+  return { edits };
+}
