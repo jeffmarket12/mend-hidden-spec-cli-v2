@@ -748,72 +748,81 @@ function matchSearchBlock(
 
 // --- Apply Logic & Execution ---
 
-function applyUnifiedHunks(fileLines: FileLines, hunks: any[], strict: boolean): { success: boolean; lines?: string[]; error?: { code: string } } {
+function applyUnifiedHunks(
+  fileLines: { lines: string[]; hasEndingNewline: boolean },
+  hunks: Array<{ oldStart: number; newStart: number; lines: Array<{ type: ' ' | '-' | '+'; text: string }>; noNewlineAtEndOfFile?: boolean }>
+, strict: boolean): { success: boolean; lines?: string[]; error?: { code: string } } {
   let lines = [...fileLines.lines];
-  // Process hunks from bottom to top so line numbers remain stable
-  const sortedHunks = [...hunks].sort((a, b) => b.oldStart - a.oldStart);
+  let d = 0;
 
-  for (const hunk of sortedHunks) {
-    const searchLines: string[] = [];
-    const replaceLines: string[] = [];
+  for (const hunk of hunks) {
+    const O: { text: string; type: ' ' | '-' }[] = [];
+    const N: { text: string; type: ' ' | '+' }[] = [];
+    
+    // Build O (context + -) and N (context + +)
     for (const hl of hunk.lines) {
       if (hl.type === ' ' || hl.type === '-') {
-        searchLines.push(hl.text);
+        O.push({ text: hl.text, type: hl.type });
       }
       if (hl.type === ' ' || hl.type === '+') {
-        replaceLines.push(hl.text);
+        N.push({ text: hl.text, type: hl.type });
       }
     }
 
-    const hint = hunk.oldStart - 1;
-    const match = matchSearchBlock(lines, searchLines, hint, strict);
-    if (match.index === -1) {
+    const A = hunk.oldStart;
+    let matchIndex = -1;
+    let tier = 1;
+
+    if (O.length === 0) {
+      matchIndex = Math.min(A + d, lines.length);
+    } else {
+      const searchLines = O.map(o => o.text);
+      const hint = A - 1 + d;
+      const match = matchSearchBlock(lines, searchLines, hint, strict);
+      matchIndex = match.index;
+      tier = match.tier;
+    }
+
+    if (matchIndex === -1) {
       return { success: false, error: { code: 'no-match' } };
     }
-    if (match.count > 1) {
-      // Check if hint distinguishes or if it's ambiguous
-      // In unified diffs, if multiple matches, check if hint matches exact oldStart
-      if (hint >= 0 && hint < lines.length) {
-        // verify exact match at hint
-        let exactAtHint = true;
-        for (let j = 0; j < searchLines.length; j++) {
-          if (lines[hint + j] !== searchLines[j]) {
-            exactAtHint = false;
-            break;
+
+    // Build finalN
+    const finalN: string[] = [];
+    if (O.length > 0) {
+      for (let i = 0; i < N.length; i++) {
+        if (N[i].type === ' ') {
+          // Context line from file
+          finalN.push(lines[matchIndex + i]);
+        } else {
+          // Non-context line (new or replaced)
+          let text = N[i].text;
+          if (tier === 2) {
+            const P = O[0].text.match(/^([ 	]*)/)?.[1] || '';
+            const F = lines[matchIndex].match(/^([ 	]*)/)?.[1] || '';
+            if (text.length > 0 && text.trim() !== '' && text.startsWith(P)) {
+              text = F + text.slice(P.length);
+            }
           }
+          finalN.push(text);
         }
-        if (!exactAtHint) {
-          return { success: false, error: { code: 'ambiguous' } };
-        }
-        lines.splice(hint, searchLines.length, ...replaceLines);
-        continue;
       }
-      return { success: false, error: { code: 'ambiguous' } };
-    }
-
-    // Apply replacement at match.index
-    // If tier 2 (indent-insensitive), re-indent replaceLines relative to file indentation
-    let finalReplace = replaceLines;
-    if (match.tier === 2 && searchLines.length > 0) {
-      const fileIndent = getIndent(lines[match.index]);
-      const searchIndent = getIndent(searchLines[0]);
-      if (fileIndent !== searchIndent) {
-        finalReplace = replaceLines.map((rLine) => {
-          if (rLine.trim() === '') return rLine;
-          const rIndent = getIndent(rLine);
-          // adjust rLine indentation
-          const stripped = stripIndent(rLine);
-          return fileIndent + stripped;
-        });
+    } else {
+      for (const nl of N) {
+        finalN.push(nl.text);
       }
     }
 
-    lines.splice(match.index, searchLines.length, ...finalReplace);
+    // Splice
+    const removeCount = O.length > 0 ? O.length : 0;
+    lines.splice(matchIndex, removeCount, ...finalN);
+    
+    // Update d: sum of (N.length - O.length)
+    d += (N.length - O.length);
   }
 
   return { success: true, lines };
 }
-
 function applyV4AUpdate(fileLines: FileLines, chunks: Array<{ anchor: string | null; oldLines: string[]; newLines: string[]; endOfFile: boolean; isContext: boolean[]; oIndex: number[] }>, strict: boolean): { success: boolean; lines?: string[]; error?: { code: string } } {
   let lines = [...fileLines.lines];
   let cursor = 0;
