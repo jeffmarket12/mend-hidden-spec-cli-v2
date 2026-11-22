@@ -269,3 +269,249 @@ function parseUnifiedDiff(text: string): ParseResult {
 
   return { edits };
 }
+
+// --- SEARCH/REPLACE + V4A + JSON Parsers ---
+
+function parseSearchReplace(text: string): ParseResult {
+  const lines = text.split(/\r?\n/);
+  const edits: EditOperation[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim() === '' || line.startsWith('#')) {
+      i++;
+      continue;
+    }
+
+    // Check for file header: <<<<<<< file: path or similar or just <<<<<<< SEARCH
+    let targetPath: string | null = null;
+    if (line.startsWith('<<<<<<< file:')) {
+      targetPath = line.slice(13).trim();
+      i++;
+    } else if (line.startsWith('<<<<<<< SEARCH')) {
+      i++;
+    } else {
+      // Maybe look for file: path header preceding SEARCH
+      if (line.startsWith('=== file:') || line.startsWith('file:')) {
+        targetPath = line.split(':')[1].trim();
+        i++;
+        continue;
+      }
+      i++;
+      continue;
+    }
+
+    // If targetPath not set yet, check if next lines specify it or if there's an explicit file header above
+    // In search-replace, often format is:
+    // path/to/file
+    // <<<<<<< SEARCH
+    // ...
+    // =======
+    // ...
+    // >>>>>>> REPLACE
+    
+    // Let's parse SEARCH lines
+    const searchLines: string[] = [];
+    let searchStartLine = i + 1;
+    while (i < lines.length && !lines[i].startsWith('=======')) {
+      searchLines.push(lines[i]);
+      i++;
+    }
+    if (i >= lines.length) {
+      return { edits: [], error: { code: 'parse', line: searchStartLine } };
+    }
+    i++; // skip =======
+
+    const replaceLines: string[] = [];
+    let replaceStartLine = i + 1;
+    while (i < lines.length && !lines[i].startsWith('>>>>>>>')) {
+      replaceLines.push(lines[i]);
+      i++;
+    }
+    if (i >= lines.length) {
+      return { edits: [], error: { code: 'parse', line: replaceStartLine } };
+    }
+    const endLine = lines[i];
+    // >>>>>>> REPLACE [path] or >>>>>>> [path]
+    const endMatch = endLine.match(/^>>>>>>>(?:\s+REPLACE)?(?:\s+(.+))?$/);
+    if (endMatch && endMatch[1]) {
+      const p = endMatch[1].trim();
+      if (p && p !== 'REPLACE') targetPath = p;
+    }
+    i++; // skip >>>>>>>
+
+    if (!targetPath) {
+      // look backwards or default? In standard search-replace, targetPath must be known or specified in header/footer
+      return { edits: [], error: { code: 'parse', line: searchStartLine } };
+    }
+
+    edits.push({
+      type: 'update',
+      path: targetPath,
+      searchLines,
+      replaceLines
+    });
+  }
+
+  if (edits.length === 0) {
+    return { edits: [], error: { code: 'parse', line: 1 } };
+  }
+
+  return { edits };
+}
+
+function parseV4A(text: string): ParseResult {
+  const lines = text.split(/\r?\n/);
+  const edits: EditOperation[] = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line.trim() === '' || line.startsWith('#')) {
+      i++;
+      continue;
+    }
+
+    if (line.startsWith('=== file:')) {
+      const filePath = line.slice(9).trim();
+      i++;
+      // read SEARCH/REPLACE or text block until next === or EOF
+      const searchLines: string[] = [];
+      const replaceLines: string[] = [];
+      let mode: 'search' | 'replace' = 'search';
+
+      while (i < lines.length && !lines[i].startsWith('===')) {
+        const l = lines[i];
+        if (l.startsWith('<<<<<<< SEARCH') || l.startsWith('<<<<<<<')) {
+          mode = 'search';
+          i++;
+          continue;
+        }
+        if (l.startsWith('=======')) {
+          mode = 'replace';
+          i++;
+          continue;
+        }
+        if (l.startsWith('>>>>>>>')) {
+          i++;
+          continue;
+        }
+        if (mode === 'search') searchLines.push(l);
+        else replaceLines.push(l);
+        i++;
+      }
+      edits.push({
+        type: 'update',
+        path: filePath,
+        searchLines,
+        replaceLines
+      });
+      continue;
+    }
+
+    if (line.startsWith('=== create:')) {
+      const filePath = line.slice(11).trim();
+      i++;
+      const fileLines: string[] = [];
+      while (i < lines.length && !lines[i].startsWith('===')) {
+        fileLines.push(lines[i]);
+        i++;
+      }
+      edits.push({
+        type: 'create',
+        path: filePath,
+        fileText: fileLines.join('\n') + (fileLines.length > 0 ? '\n' : '')
+      });
+      continue;
+    }
+
+    if (line.startsWith('=== delete:')) {
+      const filePath = line.slice(11).trim();
+      edits.push({
+        type: 'delete',
+        path: filePath
+      });
+      i++;
+      continue;
+    }
+
+    if (line.startsWith('=== move:')) {
+      const parts = line.slice(9).trim().split('->');
+      if (parts.length === 2) {
+        edits.push({
+          type: 'move',
+          path: parts[1].trim(),
+          oldPath: parts[0].trim(),
+          newPath: parts[1].trim()
+        });
+      }
+      i++;
+      continue;
+    }
+
+    i++;
+  }
+
+  if (edits.length === 0) {
+    return { edits: [], error: { code: 'parse', line: 1 } };
+  }
+
+  return { edits };
+}
+
+function parseJsonPatch(text: string): ParseResult {
+  try {
+    const data = JSON.parse(text);
+    const rawEdits = Array.isArray(data) ? data : (data.edits || data.operations || [data]);
+    const edits: EditOperation[] = [];
+
+    for (const item of rawEdits) {
+      const type = item.type || item.op || 'update';
+      const p = item.path || item.file || item.target;
+      if (!p) {
+        return { edits: [], error: { code: 'parse', line: 1 } };
+      }
+
+      if (type === 'create') {
+        edits.push({
+          type: 'create',
+          path: p,
+          fileText: item.file_text ?? item.content ?? item.text ?? ''
+        });
+      } else if (type === 'delete') {
+        edits.push({
+          type: 'delete',
+          path: p
+        });
+      } else if (type === 'move' || type === 'rename') {
+        const oldP = item.old_path || item.old || item.from;
+        const newP = item.new_path || item.new || item.to || p;
+        edits.push({
+          type: 'move',
+          path: newP,
+          oldPath: oldP,
+          newPath: newP
+        });
+      } else {
+        // update
+        const searchLines = item.search_lines || item.search || (item.old_text ? item.old_text.split('\n') : undefined);
+        const replaceLines = item.replace_lines || item.replace || (item.new_text ? item.new_text.split('\n') : undefined);
+        edits.push({
+          type: 'update',
+          path: p,
+          searchLines: Array.isArray(searchLines) ? searchLines : (searchLines ? searchLines.split('\n') : []),
+          replaceLines: Array.isArray(replaceLines) ? replaceLines : (replaceLines ? replaceLines.split('\n') : [])
+        });
+      }
+    }
+
+    if (edits.length === 0) {
+      return { edits: [], error: { code: 'parse', line: 1 } };
+    }
+
+    return { edits };
+  } catch (err: any) {
+    return { edits: [], error: { code: 'parse', line: 1 } };
+  }
+}
