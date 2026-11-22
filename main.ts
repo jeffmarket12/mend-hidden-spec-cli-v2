@@ -124,6 +124,7 @@ interface EditOperation {
   replaceLines?: string[];
   fileText?: string; // for create / json
   hunks?: any[]; // for unified
+  chunks?: Array<{ anchor: string | null; oldLines: string[]; newLines: string[]; endOfFile: boolean }>;
 }
 
 interface ApplyResult {
@@ -356,102 +357,226 @@ function parseSearchReplace(text: string): ParseResult {
 function parseV4A(text: string): ParseResult {
   const lines = text.split(/\r?\n/);
   const edits: EditOperation[] = [];
-  let i = 0;
 
-  while (i < lines.length) {
-    const line = lines[i];
-    if (line.trim() === '' || line.startsWith('#')) {
+  function trimTrailingBlanks(secLines: Array<{ line: string; num: number }>) {
+    const res = [...secLines];
+    while (res.length > 0 && res[res.length - 1].line.trim() === "") {
+      res.pop();
+    }
+    return res;
+  }
+
+  let firstNonBlankIdx = -1;
+  let firstNonBlankText = "";
+  for (let idx = 0; idx < lines.length; idx++) {
+    const t = lines[idx].trim();
+    if (t !== "") {
+      firstNonBlankIdx = idx;
+      firstNonBlankText = t;
+      break;
+    }
+  }
+
+  if (firstNonBlankIdx === -1 || firstNonBlankText !== "*** Begin Patch") {
+    const errLine = firstNonBlankIdx === -1 ? 1 : firstNonBlankIdx + 1;
+    return { edits: [], error: { code: "parse", line: errLine } };
+  }
+
+  let lastNonBlankIdx = -1;
+  let lastNonBlankText = "";
+  for (let idx = lines.length - 1; idx >= 0; idx--) {
+    const t = lines[idx].trim();
+    if (t !== "") {
+      lastNonBlankIdx = idx;
+      lastNonBlankText = t;
+      break;
+    }
+  }
+
+  if (lastNonBlankText !== "*** End Patch") {
+    const errLine = lastNonBlankIdx === -1 ? lines.length + 1 : lastNonBlankIdx + 1;
+    return { edits: [], error: { code: "parse", line: errLine } };
+  }
+
+  let i = firstNonBlankIdx + 1;
+  const endIdx = lastNonBlankIdx;
+
+  while (i < endIdx) {
+    const rawLine = lines[i];
+    const trimmed = rawLine.trim();
+
+    if (trimmed === "") {
       i++;
       continue;
     }
 
-    if (line.startsWith('=== file:')) {
-      const filePath = line.slice(9).trim();
+    if (trimmed.startsWith("*** Add File:")) {
+      const path = trimmed.slice(13).trim();
       i++;
-      // read SEARCH/REPLACE or text block until next === or EOF
-      const searchLines: string[] = [];
-      const replaceLines: string[] = [];
-      let mode: 'search' | 'replace' = 'search';
-
-      while (i < lines.length && !lines[i].startsWith('===')) {
+      const secLines: Array<{ line: string; num: number }> = [];
+      while (i < endIdx) {
         const l = lines[i];
-        if (l.startsWith('<<<<<<< SEARCH') || l.startsWith('<<<<<<<')) {
-          mode = 'search';
-          i++;
-          continue;
+        const t = l.trim();
+        if (t.startsWith("*** Add File:") || t.startsWith("*** Delete File:") || t.startsWith("*** Update File:")) {
+          break;
         }
-        if (l.startsWith('=======')) {
-          mode = 'replace';
-          i++;
-          continue;
-        }
-        if (l.startsWith('>>>>>>>')) {
-          i++;
-          continue;
-        }
-        if (mode === 'search') searchLines.push(l);
-        else replaceLines.push(l);
+        secLines.push({ line: l, num: i + 1 });
         i++;
       }
+      const trimmedSec = trimTrailingBlanks(secLines);
+      const fileText = trimmedSec.map(item => {
+        const l = item.line;
+        if (l.startsWith("+")) return l.slice(1);
+        return l;
+      }).join("\n") + (trimmedSec.length > 0 ? "\n" : "");
+
       edits.push({
-        type: 'update',
-        path: filePath,
-        searchLines,
-        replaceLines
+        type: "create",
+        path,
+        fileText
       });
       continue;
     }
 
-    if (line.startsWith('=== create:')) {
-      const filePath = line.slice(11).trim();
+    if (trimmed.startsWith("*** Delete File:")) {
+      const path = trimmed.slice(15).trim();
       i++;
-      const fileLines: string[] = [];
-      while (i < lines.length && !lines[i].startsWith('===')) {
-        fileLines.push(lines[i]);
+      const secLines: Array<{ line: string; num: number }> = [];
+      while (i < endIdx) {
+        const l = lines[i];
+        const t = l.trim();
+        if (t.startsWith("*** Add File:") || t.startsWith("*** Delete File:") || t.startsWith("*** Update File:")) {
+          break;
+        }
+        secLines.push({ line: l, num: i + 1 });
         i++;
       }
-      edits.push({
-        type: 'create',
-        path: filePath,
-        fileText: fileLines.join('\n') + (fileLines.length > 0 ? '\n' : '')
-      });
-      continue;
-    }
-
-    if (line.startsWith('=== delete:')) {
-      const filePath = line.slice(11).trim();
-      edits.push({
-        type: 'delete',
-        path: filePath
-      });
-      i++;
-      continue;
-    }
-
-    if (line.startsWith('=== move:')) {
-      const parts = line.slice(9).trim().split('->');
-      if (parts.length === 2) {
-        edits.push({
-          type: 'move',
-          path: parts[1].trim(),
-          oldPath: parts[0].trim(),
-          newPath: parts[1].trim()
-        });
+      const trimmedSec = trimTrailingBlanks(secLines);
+      if (trimmedSec.length > 0) {
+        return { edits: [], error: { code: "parse", line: trimmedSec[0].num } };
       }
-      i++;
+      edits.push({
+        type: "delete",
+        path
+      });
       continue;
     }
 
-    i++;
+    if (trimmed.startsWith("*** Update File:")) {
+      const updateLineNum = i + 1;
+      const path = trimmed.slice(15).trim();
+      i++;
+      const secLines: Array<{ line: string; num: number }> = [];
+      while (i < endIdx) {
+        const l = lines[i];
+        const t = l.trim();
+        if (t.startsWith("*** Add File:") || t.startsWith("*** Delete File:") || t.startsWith("*** Update File:")) {
+          break;
+        }
+        secLines.push({ line: l, num: i + 1 });
+        i++;
+      }
+
+      const trimmedSecLines = trimTrailingBlanks(secLines);
+
+      let movePath: string | undefined = undefined;
+      let chunkStartIdx = 0;
+
+      if (trimmedSecLines.length > 0 && trimmedSecLines[0].line.trim().startsWith("*** Move to:")) {
+        movePath = trimmedSecLines[0].line.trim().slice(11).trim();
+        chunkStartIdx = 1;
+      }
+
+      if (chunkStartIdx >= trimmedSecLines.length && !movePath) {
+        return { edits: [], error: { code: "parse", line: updateLineNum } };
+      }
+
+      const chunks: Array<{ anchor: string | null; oldLines: string[]; newLines: string[]; endOfFile: boolean }> = [];
+      let ci = chunkStartIdx;
+
+      while (ci < trimmedSecLines.length) {
+        let anchor: string | null = null;
+        const firstItem = trimmedSecLines[ci];
+        const firstTrimmed = firstItem.line.trim();
+
+        if (firstTrimmed.startsWith("@@")) {
+          anchor = firstTrimmed.slice(2).trim();
+          if (anchor === "") anchor = null;
+          ci++;
+        }
+
+        const oldLines: string[] = [];
+        const newLines: string[] = [];
+        let endOfFile = false;
+        let hasChunkContent = false;
+
+        while (ci < trimmedSecLines.length) {
+          const item = trimmedSecLines[ci];
+          const l = item.line;
+          const t = l.trim();
+
+          if (t.startsWith("@@")) {
+            break;
+          }
+          if (t === "*** End of File") {
+            endOfFile = true;
+            ci++;
+            hasChunkContent = true;
+            break;
+          }
+
+          if (l.startsWith(" ")) {
+            const body = l.slice(1);
+            oldLines.push(body);
+            newLines.push(body);
+            hasChunkContent = true;
+            ci++;
+          } else if (l.startsWith("-")) {
+            const body = l.slice(1);
+            oldLines.push(body);
+            hasChunkContent = true;
+            ci++;
+          } else if (l.startsWith("+")) {
+            const body = l.slice(1);
+            newLines.push(body);
+            hasChunkContent = true;
+            ci++;
+          } else if (l === "") {
+            oldLines.push("");
+            newLines.push("");
+            hasChunkContent = true;
+            ci++;
+          } else {
+            return { edits: [], error: { code: "parse", line: item.num } };
+          }
+        }
+
+        if (!hasChunkContent) {
+          return { edits: [], error: { code: "parse", line: firstItem.num } };
+        }
+
+        chunks.push({ anchor, oldLines, newLines, endOfFile });
+      }
+
+      edits.push({
+        type: "update",
+        path,
+        oldPath: movePath ? path : undefined,
+        newPath: movePath,
+        chunks
+      });
+      continue;
+    }
+
+    return { edits: [], error: { code: "parse", line: i + 1 } };
   }
 
   if (edits.length === 0) {
-    return { edits: [], error: { code: 'parse', line: 1 } };
+    return { edits: [], error: { code: "parse", line: 1 } };
   }
 
   return { edits };
 }
-
 function parseJsonPatch(text: string): ParseResult {
   try {
     const data = JSON.parse(text);
@@ -676,6 +801,117 @@ function applyUnifiedHunks(fileLines: FileLines, hunks: any[], strict: boolean):
     }
 
     lines.splice(match.index, searchLines.length, ...finalReplace);
+  }
+
+  return { success: true, lines };
+}
+
+function applyV4AUpdate(fileLines: FileLines, chunks: Array<{ anchor: string | null; oldLines: string[]; newLines: string[]; endOfFile: boolean }>, strict: boolean): { success: boolean; lines?: string[]; error?: { code: string } } {
+  let lines = [...fileLines.lines];
+  let cursor = 0;
+
+  for (const chunk of chunks) {
+    let matchIdx = -1;
+    let matchTier = 0;
+
+    if (chunk.anchor !== null) {
+      let foundAnchor = -1;
+      for (let tier = 0; tier <= (strict ? 0 : 2); tier++) {
+        let bestIdx = -1;
+        for (let idx = cursor; idx <= lines.length - 1; idx++) {
+          let matched = false;
+          if (tier === 0) {
+            matched = (lines[idx] === chunk.anchor);
+          } else if (tier === 1) {
+            matched = (lines[idx].trimEnd() === chunk.anchor.trimEnd());
+          } else if (tier === 2) {
+            matched = (lines[idx].trim() === chunk.anchor.trim());
+          }
+          if (matched) {
+            bestIdx = idx;
+            matchTier = tier;
+            break;
+          }
+        }
+        if (bestIdx !== -1) {
+          foundAnchor = bestIdx;
+          break;
+        }
+      }
+      if (foundAnchor === -1) {
+        return { success: false, error: { code: "no-match" } };
+      }
+      matchIdx = foundAnchor;
+      cursor = matchIdx + 1;
+    }
+
+    const O = chunk.oldLines;
+    const N = chunk.newLines;
+
+    if (O.length === 0) {
+      let insPos = cursor;
+      if (chunk.endOfFile) {
+        insPos = lines.length;
+      }
+      lines.splice(insPos, 0, ...N);
+      cursor = insPos + N.length;
+      continue;
+    }
+
+    let targetIdx = -1;
+    let targetTier = 0;
+
+    const maxTier = strict ? 0 : 2;
+    for (let tier = 0; tier <= maxTier; tier++) {
+      let found = -1;
+      for (let idx = cursor; idx <= lines.length - O.length; idx++) {
+        if (chunk.endOfFile && (idx + O.length !== lines.length)) {
+          continue;
+        }
+        let matched = true;
+        for (let j = 0; j < O.length; j++) {
+          const fLine = lines[idx + j];
+          const oLine = O[j];
+          if (tier === 0) {
+            if (fLine !== oLine) { matched = false; break; }
+          } else if (tier === 1) {
+            if (fLine.trimEnd() !== oLine.trimEnd()) { matched = false; break; }
+          } else if (tier === 2) {
+            if (fLine.trim() === "" && oLine.trim() === "") continue;
+            if (stripIndent(fLine) !== stripIndent(oLine)) { matched = false; break; }
+          }
+        }
+        if (matched) {
+          found = idx;
+          targetTier = tier;
+          break;
+        }
+      }
+      if (found !== -1) {
+        targetIdx = found;
+        break;
+      }
+    }
+
+    if (targetIdx === -1) {
+      return { success: false, error: { code: "no-match" } };
+    }
+
+    let finalN = N;
+    if (targetTier === 2 && O.length > 0) {
+      const fileIndent = getIndent(lines[targetIdx]);
+      const searchIndent = getIndent(O[0]);
+      if (fileIndent !== searchIndent) {
+        finalN = N.map((rLine) => {
+          if (rLine.trim() === "") return rLine;
+          const stripped = stripIndent(rLine);
+          return fileIndent + stripped;
+        });
+      }
+    }
+
+    lines.splice(targetIdx, O.length, ...finalN);
+    cursor = targetIdx + finalN.length;
   }
 
   return { success: true, lines };
