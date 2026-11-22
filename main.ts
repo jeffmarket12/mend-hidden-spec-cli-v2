@@ -44,13 +44,13 @@ function serializeFile(fc: FileContent): string {
   return res;
 }
 
-function matchTier0(fileLines: string[], oLines: string[]): number[] {
+function locateGrade0(docRows: string[], oLines: string[]): number[] {
   const matches: number[] = [];
-  if (oLines.length === 0 || oLines.length > fileLines.length) return matches;
-  for (let i = 0; i <= fileLines.length - oLines.length; i++) {
+  if (oLines.length === 0 || oLines.length > docRows.length) return matches;
+  for (let i = 0; i <= docRows.length - oLines.length; i++) {
     let ok = true;
     for (let j = 0; j < oLines.length; j++) {
-      if (fileLines[i + j] !== oLines[j]) { ok = false; break; }
+      if (docRows[i + j] !== oLines[j]) { ok = false; break; }
     }
     if (ok) matches.push(i);
   }
@@ -58,12 +58,12 @@ function matchTier0(fileLines: string[], oLines: string[]): number[] {
 }
 
 function cleanTier1(s: string): string { return s.replace(/[ \t]+$/, ''); }
-function matchTier1(fileLines: string[], oLines: string[]): number[] {
+function locateGrade1(docRows: string[], oLines: string[]): number[] {
   const matches: number[] = [];
-  if (oLines.length === 0 || oLines.length > fileLines.length) return matches;
-  const cleanedFile = fileLines.map(cleanTier1);
+  if (oLines.length === 0 || oLines.length > docRows.length) return matches;
+  const cleanedFile = docRows.map(cleanTier1);
   const cleanedO = oLines.map(cleanTier1);
-  for (let i = 0; i <= fileLines.length - oLines.length; i++) {
+  for (let i = 0; i <= docRows.length - oLines.length; i++) {
     let ok = true;
     for (let j = 0; j < cleanedO.length; j++) {
       if (cleanedFile[i + j] !== cleanedO[j]) { ok = false; break; }
@@ -74,12 +74,12 @@ function matchTier1(fileLines: string[], oLines: string[]): number[] {
 }
 
 function cleanTier2(s: string): string { return s.replace(/^[ \t]+|[ \t]+$/g, ''); }
-function matchTier2(fileLines: string[], oLines: string[]): number[] {
+function locateGrade2(docRows: string[], oLines: string[]): number[] {
   const matches: number[] = [];
-  if (oLines.length === 0 || oLines.length > fileLines.length) return matches;
-  const cleanedFile = fileLines.map(cleanTier2);
+  if (oLines.length === 0 || oLines.length > docRows.length) return matches;
+  const cleanedFile = docRows.map(cleanTier2);
   const cleanedO = oLines.map(cleanTier2);
-  for (let i = 0; i <= fileLines.length - oLines.length; i++) {
+  for (let i = 0; i <= docRows.length - oLines.length; i++) {
     let ok = true;
     for (let j = 0; j < cleanedO.length; j++) {
       if (cleanedFile[i + j] !== cleanedO[j]) { ok = false; break; }
@@ -89,32 +89,21 @@ function matchTier2(fileLines: string[], oLines: string[]): number[] {
   return matches;
 }
 
-function findOccurrence(fileLines: string[], oLines: string[], strict: boolean): { index: number; tier: number } | null {
+function locateInstance(docRows: string[], oLines: string[], rigid: boolean): { index: number; tier: number } | null {
   if (oLines.length === 0) return null;
-  const t0 = matchTier0(fileLines, oLines);
+  const t0 = locateGrade0(docRows, oLines);
   if (t0.length > 0) return { index: t0[0], tier: 0 };
-  if (strict) return null;
-  const t1 = matchTier1(fileLines, oLines);
+  if (rigid) return null;
+  const t1 = locateGrade1(docRows, oLines);
   if (t1.length > 0) return { index: t1[0], tier: 1 };
-  const t2 = matchTier2(fileLines, oLines);
+  const t2 = locateGrade2(docRows, oLines);
   if (t2.length > 0) return { index: t2[0], tier: 2 };
   return null;
 }
 
-function getLeadingWhitespace(s: string): string {
+function extractLeadingIndent(s: string): string {
   const m = s.match(/^[ \t]*/);
   return m ? m[0] : '';
-}
-
-function transformNewLines(nLines: string[], fileFirstMatchedLine: string, oFirstLine: string, tier: number): string[] {
-  if (tier < 2) return [...nLines];
-  const fIndent = getLeadingWhitespace(fileFirstMatchedLine);
-  const pIndent = getLeadingWhitespace(oFirstLine);
-  return nLines.map(line => {
-    if (!line || line.trim() === '') return line;
-    if (pIndent && line.startsWith(pIndent)) return fIndent + line.slice(pIndent.length);
-    return line;
-  });
 }
 
 // Align old (o) and new (n) lines via LCS under the tier's equality, then build
@@ -122,16 +111,16 @@ function transformNewLines(nLines: string[], fileFirstMatchedLine: string, oFirs
 // the FILE's own matched line, never the patch's (SPEC) — this drops the
 // patch's trailing whitespace / indentation from context lines. Lines only in
 // n are additions and are emitted as the patch wrote them (with the tier-2
-// indent transform applied). fileLines[i] is the file's line matching o[i].
-function alignReplace(oLines: string[], nLines: string[], fileLines: string[], tier: number): string[] {
+// indent transform applied). docRows[i] is the file's line matching o[i].
+function reconcileReplace(oLines: string[], nLines: string[], docRows: string[], tier: number): string[] {
   const eq = (a: string, b: string) => tier === 0 ? a === b : tier === 1 ? a.replace(/[ \t]+$/, '') === b.replace(/[ \t]+$/, '') : a.replace(/^[ \t]+|[ \t]+$/g, '') === b.replace(/^[ \t]+|[ \t]+$/g, '');
   const m = oLines.length, n = nLines.length;
   const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
   for (let i = m - 1; i >= 0; i--) for (let j = n - 1; j >= 0; j--) {
     dp[i][j] = eq(oLines[i], nLines[j]) ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
   }
-  const fIndent = tier >= 2 && fileLines.length > 0 ? getLeadingWhitespace(fileLines[0]) : '';
-  const pIndent = tier >= 2 && oLines.length > 0 ? getLeadingWhitespace(oLines[0]) : '';
+  const fIndent = tier >= 2 && docRows.length > 0 ? extractLeadingIndent(docRows[0]) : '';
+  const pIndent = tier >= 2 && oLines.length > 0 ? extractLeadingIndent(oLines[0]) : '';
   const shiftIndent = (line: string) => {
     if (tier < 2) return line;
     if (line === '' || line.trim() === '') return line;
@@ -144,7 +133,7 @@ function alignReplace(oLines: string[], nLines: string[], fileLines: string[], t
   const out: string[] = [];
   let i = 0, j = 0;
   while (i < m && j < n) {
-    if (eq(oLines[i], nLines[j])) { out.push(fileLines[i]); i++; j++; }
+    if (eq(oLines[i], nLines[j])) { out.push(docRows[i]); i++; j++; }
     else if (dp[i + 1][j] >= dp[i][j + 1]) { i++; }
     else { out.push(shiftIndent(nLines[j])); j++; }
   }
@@ -479,7 +468,7 @@ function buildReplacement(
   tier: number
 ): string[] {
   if (hc.body) return buildFromBody(hc.body, hc.o, fileLines, tier);
-  return alignReplace(hc.o, hc.n, fileLines, tier);
+  return reconcileReplace(hc.o, hc.n, fileLines, tier);
 }
 
 // Apply V4A chunks to file content. Returns the new content or a failure reason.
@@ -490,7 +479,7 @@ function applyChunks(content: string, chunks: { anchor?: string; o: string[]; n:
     if (chunk.isEof) {
       if (chunk.anchor) {
         let matchIdx = -1;
-        for (const fn of [matchTier0, matchTier1, matchTier2]) {
+        for (const fn of [locateGrade0, locateGrade1, locateGrade2]) {
           for (const m of fn(fc.lines, [chunk.anchor])) { if (m + 1 === fc.lines.length) { matchIdx = m; break; } }
           if (matchIdx !== -1) break;
         }
@@ -509,7 +498,7 @@ function applyChunks(content: string, chunks: { anchor?: string; o: string[]; n:
       }
       let eofIdx = -1, eofTier = -1;
       for (const t of (strict ? [0] : [0, 1, 2])) {
-        const fn = t === 0 ? matchTier0 : t === 1 ? matchTier1 : matchTier2;
+        const fn = t === 0 ? locateGrade0 : t === 1 ? locateGrade1 : locateGrade2;
         for (const m of fn(fc.lines, chunk.o)) {
           if (m + chunk.o.length === fc.lines.length) { eofIdx = m; eofTier = t; break; }
         }
@@ -524,7 +513,7 @@ function applyChunks(content: string, chunks: { anchor?: string; o: string[]; n:
     if (chunk.anchor) {
       let foundMatch: { index: number; tier: number } | null = null;
       for (const t of (strict ? [0] : [0, 1, 2])) {
-        const fn = t === 0 ? matchTier0 : t === 1 ? matchTier1 : matchTier2;
+        const fn = t === 0 ? locateGrade0 : t === 1 ? locateGrade1 : locateGrade2;
         const matches = fn(fc.lines.slice(cursor), [chunk.anchor]);
         if (matches.length > 0) { foundMatch = { index: cursor + matches[0], tier: t }; break; }
       }
@@ -532,7 +521,7 @@ function applyChunks(content: string, chunks: { anchor?: string; o: string[]; n:
       cursor = foundMatch.index + 1;
     }
     if (chunk.o.length > 0) {
-      const occ = findOccurrence(fc.lines.slice(cursor), chunk.o, strict);
+      const occ = locateInstance(fc.lines.slice(cursor), chunk.o, strict);
       if (!occ) return { ok: false, reason: 'no-match' };
       const absIndex = cursor + occ.index;
       const transN = buildReplacement(chunk, fc.lines.slice(absIndex, absIndex + chunk.o.length), occ.tier);
@@ -557,7 +546,7 @@ function applyHunks(content: string, hunks: { o: string[]; n: string[]; hasEol: 
       hunkSumD += nLinesCleaned.length - oLinesCleaned.length;
     } else {
       let matches: { index: number; tier: number }[] = [];
-      const fn = (t: number) => t === 0 ? matchTier0 : t === 1 ? matchTier1 : matchTier2;
+      const fn = (t: number) => t === 0 ? locateGrade0 : t === 1 ? locateGrade1 : locateGrade2;
       for (const t of (strict ? [0] : [0, 1, 2])) {
         const res = fn(t)(fc.lines, oLinesCleaned);
         if (res.length > 0) { matches = res.map(idx => ({ index: idx, tier: t })); break; }
@@ -661,11 +650,11 @@ function runEdits(ops: EditOp[], strict: boolean): ExecutionResult {
         for (const chunk of op.chunks) {
           if (chunk.isEof) {
             if (chunk.anchor) {
-              const matches = matchTier0(fc.lines, [chunk.anchor]);
+              const matches = locateGrade0(fc.lines, [chunk.anchor]);
               let matchIdx = -1;
               for (const m of matches) { if (m + 1 === fc.lines.length) { matchIdx = m; break; } }
-              if (matchIdx === -1) { const t1 = matchTier1(fc.lines, [chunk.anchor]); for (const m of t1) { if (m + 1 === fc.lines.length) { matchIdx = m; break; } } }
-              if (matchIdx === -1) { const t2 = matchTier2(fc.lines, [chunk.anchor]); for (const m of t2) { if (m + 1 === fc.lines.length) { matchIdx = m; break; } } }
+              if (matchIdx === -1) { const t1 = locateGrade1(fc.lines, [chunk.anchor]); for (const m of t1) { if (m + 1 === fc.lines.length) { matchIdx = m; break; } } }
+              if (matchIdx === -1) { const t2 = locateGrade2(fc.lines, [chunk.anchor]); for (const m of t2) { if (m + 1 === fc.lines.length) { matchIdx = m; break; } } }
               if (matchIdx === -1) { failed = true; failReason = 'no-match'; break; }
               cursor = matchIdx + 1;
               // The anchor is the file's last line, so o-lines after it cannot match.
@@ -681,7 +670,7 @@ function runEdits(ops: EditOp[], strict: boolean): ExecutionResult {
             }
             let eofIdx = -1, eofTier = -1;
             for (const t of (strict ? [0] : [0, 1, 2])) {
-              const fn = t === 0 ? matchTier0 : t === 1 ? matchTier1 : matchTier2;
+              const fn = t === 0 ? locateGrade0 : t === 1 ? locateGrade1 : locateGrade2;
               for (const m of fn(fc.lines, chunk.o)) {
                 if (m + chunk.o.length === fc.lines.length) { eofIdx = m; eofTier = t; break; }
               }
@@ -696,7 +685,7 @@ function runEdits(ops: EditOp[], strict: boolean): ExecutionResult {
           if (chunk.anchor) {
             let foundMatch: { index: number; tier: number } | null = null;
             for (const t of (strict ? [0] : [0, 1, 2])) {
-              const fn = t === 0 ? matchTier0 : t === 1 ? matchTier1 : matchTier2;
+              const fn = t === 0 ? locateGrade0 : t === 1 ? locateGrade1 : locateGrade2;
               const matches = fn(fc.lines.slice(cursor), [chunk.anchor]);
               if (matches.length > 0) { foundMatch = { index: cursor + matches[0], tier: t }; break; }
             }
@@ -704,7 +693,7 @@ function runEdits(ops: EditOp[], strict: boolean): ExecutionResult {
             cursor = foundMatch.index + 1;
           }
           if (chunk.o.length > 0) {
-             const occ = findOccurrence(fc.lines.slice(cursor), chunk.o, strict);
+             const occ = locateInstance(fc.lines.slice(cursor), chunk.o, strict);
              if (!occ) { failed = true; failReason = 'no-match'; break; }
              const absIndex = cursor + occ.index;
              const transN = buildReplacement(chunk, fc.lines.slice(absIndex, absIndex + chunk.o.length), occ.tier);
@@ -733,7 +722,7 @@ function runEdits(ops: EditOp[], strict: boolean): ExecutionResult {
             hunkSumD += nLinesCleaned.length - oLinesCleaned.length;
           } else {
             let matches: { index: number; tier: number }[] = [];
-            const fn = (t: number) => t === 0 ? matchTier0 : t === 1 ? matchTier1 : matchTier2;
+            const fn = (t: number) => t === 0 ? locateGrade0 : t === 1 ? locateGrade1 : locateGrade2;
             for (const t of (strict ? [0] : [0, 1, 2])) {
               const res = fn(t)(fc.lines, oLinesCleaned);
               if (res.length > 0) { matches = res.map(idx => ({ index: idx, tier: t })); break; }
