@@ -715,3 +715,335 @@ function applySearchReplaceEdit(fileLines: FileLines, searchLines: string[], rep
   newLines.splice(match.index, searchLines.length, ...finalReplace);
   return { success: true, lines: newLines };
 }
+
+// --- Main Flow & Invocation ---
+
+function main() {
+  const cliArgs = process.argv.slice(2);
+  const parsedCli = parseCliArgs(cliArgs);
+  if (parsedCli.error || !parsedCli.args) {
+    process.stdout.write('error: usage\n');
+    process.exit(2);
+  }
+
+  const { format: explicitFormat, check, strict, patchPath } = parsedCli.args;
+
+  // Read patch from stdin or file
+  let patchText = '';
+  try {
+    if (patchPath === null || patchPath === '-') {
+      patchText = fs.readFileSync(0, 'utf8');
+    } else {
+      if (!fs.existsSync(patchPath)) {
+        process.stdout.write('error: no-patch\n');
+        process.exit(2);
+      }
+      patchText = fs.readFileSync(patchPath, 'utf8');
+    }
+  } catch (err) {
+    process.stdout.write('error: no-patch\n');
+    process.exit(2);
+  }
+
+  // Detect format if not specified
+  let format = explicitFormat;
+  if (!format) {
+    const detected = detectFormat(patchText);
+    if (!detected) {
+      process.stdout.write('error: format\n');
+      process.exit(2);
+    }
+    format = detected;
+  }
+
+  // Parse patch
+  let parseResult: ParseResult;
+  if (format === 'unified') {
+    parseResult = parseUnifiedDiff(patchText);
+  } else if (format === 'search-replace') {
+    parseResult = parseSearchReplace(patchText);
+  } else if (format === 'v4a') {
+    parseResult = parseV4A(patchText);
+  } else if (format === 'json') {
+    parseResult = parseJsonPatch(patchText);
+  } else {
+    process.stdout.write('error: format\n');
+    process.exit(2);
+  }
+
+  if (parseResult.error) {
+    process.stdout.write(`error: parse ${parseResult.error.line}\n`);
+    process.exit(2);
+  }
+
+  const edits = parseResult.edits;
+  if (edits.length === 0) {
+    process.stdout.write('error: parse 1\n');
+    process.exit(2);
+  }
+
+  // Validate paths safety before doing anything
+  for (const edit of edits) {
+    const p = edit.path;
+    if (!isSafePath(p)) {
+      process.stdout.write(`error: unsafe ${p}\n`);
+      process.exit(1);
+    }
+    if (edit.oldPath && !isSafePath(edit.oldPath)) {
+      process.stdout.write(`error: unsafe ${edit.oldPath}\n`);
+      process.exit(1);
+    }
+    if (edit.newPath && !isSafePath(edit.newPath)) {
+      process.stdout.write(`error: unsafe ${edit.newPath}\n`);
+      process.exit(1);
+    }
+  }
+
+  // Simulate or prepare file states
+  // We need virtual file system state or working on actual files.
+  // Since mend operates on the working directory, let's load files as needed or simulate.
+  // But wait! If an edit fails halfway, atomicity requires ALL edits to succeed or nothing changes.
+  // So we run a dry-run validation of all edits first.
+
+  const fileStates = new Map<string, { exists: boolean; content?: string; lines?: FileLines }>();
+
+  function getFileState(p: string) {
+    if (fileStates.has(p)) return fileStates.get(p)!;
+    const exists = fs.existsSync(p);
+    let content: string | undefined;
+    let lines: FileLines | undefined;
+    if (exists) {
+      content = fs.readFileSync(p, 'utf8');
+      lines = parseFileContent(content);
+    }
+    const state = { exists, content, lines };
+    fileStates.set(p, state);
+    return state;
+  }
+
+  const plannedChanges: Array<{
+    type: 'M' | 'A' | 'D' | 'R';
+    path: string;
+    oldPath?: string;
+    newPath?: string;
+    newContent?: string;
+  }> = [];
+
+  const errorLines: string[] = [];
+
+  // Track virtual file modifications during dry run / staging
+  const virtualFiles = new Map<string, { exists: boolean; lines?: FileLines; raw?: string }>();
+
+  function getVirtualFile(p: string) {
+    if (virtualFiles.has(p)) return virtualFiles.get(p)!;
+    const st = getFileState(p);
+    const v = { exists: st.exists, lines: st.lines ? { lines: [...st.lines.lines], crlf: st.lines.crlf, hasEndingNewline: st.lines.hasEndingNewline } : undefined, raw: st.content };
+    virtualFiles.set(p, v);
+    return v;
+  }
+
+  for (const edit of edits) {
+    if (edit.type === 'create') {
+      const v = getVirtualFile(edit.path);
+      if (v.exists) {
+        errorLines.push(`error: exists ${edit.path}`);
+        continue;
+      }
+      virtualFiles.set(edit.path, { exists: true, raw: edit.fileText ?? '' });
+      plannedChanges.push({ type: 'A', path: edit.path });
+    } else if (edit.type === 'delete') {
+      const v = getVirtualFile(edit.path);
+      if (!v.exists) {
+        errorLines.push(`error: missing ${edit.path}`);
+        continue;
+      }
+      virtualFiles.set(edit.path, { exists: false });
+      plannedChanges.push({ type: 'D', path: edit.path });
+    } else if (edit.type === 'move') {
+      const oldP = edit.oldPath!;
+      const newP = edit.newPath!;
+      const vOld = getVirtualFile(oldP);
+      const vNew = getVirtualFile(newP);
+      if (!vOld.exists) {
+        errorLines.push(`error: missing ${oldP}`);
+        continue;
+      }
+      if (vNew.exists) {
+        errorLines.push(`error: exists ${newP}`);
+        continue;
+      }
+      virtualFiles.set(oldP, { exists: false });
+      virtualFiles.set(newP, vOld);
+      plannedChanges.push({ type: 'R', path: newP, oldPath: oldP, newPath: newP });
+    } else {
+      // update
+      const v = getVirtualFile(edit.path);
+      if (!v.exists) {
+        errorLines.push(`error: missing ${edit.path}`);
+        continue;
+      }
+      if (edit.hunks) {
+        // unified
+        // parse lines if not parsed
+        if (!v.lines && v.raw !== undefined) {
+          v.lines = parseFileContent(v.raw);
+        }
+        const res = applyUnifiedHunks(v.lines || { lines: [], crlf: false, hasEndingNewline: false }, edit.hunks, strict);
+        if (!res.success) {
+          errorLines.push(`error: ${res.error?.code || 'no-match'} ${edit.path}`);
+          continue;
+        }
+        v.lines = {
+          lines: res.lines!,
+          crlf: v.lines?.crlf ?? false,
+          hasEndingNewline: v.lines?.hasEndingNewline ?? true
+        };
+        plannedChanges.push({ type: 'M', path: edit.path });
+      } else {
+        // search-replace
+        if (!v.lines && v.raw !== undefined) {
+          v.lines = parseFileContent(v.raw);
+        }
+        const res = applySearchReplaceEdit(v.lines || { lines: [], crlf: false, hasEndingNewline: false }, edit.searchLines || [], edit.replaceLines || [], strict);
+        if (!res.success) {
+          errorLines.push(`error: ${res.error?.code || 'no-match'} ${edit.path}`);
+          continue;
+        }
+        v.lines = {
+          lines: res.lines!,
+          crlf: v.lines?.crlf ?? false,
+          hasEndingNewline: v.lines?.hasEndingNewline ?? true
+        };
+        plannedChanges.push({ type: 'M', path: edit.path });
+      }
+    }
+  }
+
+  if (errorLines.length > 0) {
+    for (const errLine of errorLines) {
+      process.stdout.write(errLine + '\n');
+    }
+    process.stdout.write(`failed: ${errorLines.length} of ${edits.length} edits\n`);
+    process.exit(1);
+  }
+
+  // If --check, do not write anything, but output success summary as if written
+  // Wait, does --check output ok: N files?
+  // SPEC 1: "--check does everything but write: the same output and exit code as without it, and no file is created, changed or deleted."
+  // So yes, exit 0 and print the changes and ok: N files.
+
+  // Deduplicate / consolidate planned changes and check if content actually changed
+  const finalChanges: Array<{ type: string; lineStr: string; sortKey: string }> = [];
+
+  // Group by path to determine final state vs original state
+  const touchedPaths = new Set<string>();
+  for (const c of plannedChanges) {
+    if (c.oldPath) touchedPaths.add(c.oldPath);
+    touchedPaths.add(c.path);
+  }
+
+  // Check rename optimization: if oldPath deleted and newPath created with same content or move op
+  const moves = plannedChanges.filter(c => c.type === 'R');
+  const nonMoveChanges = plannedChanges.filter(c => c.type !== 'R');
+
+  // Let's build map of path -> final content vs original content
+  const pathSummary = new Map<string, string>(); // path -> action type (A, D, M, R)
+
+  // Actually, let's compare virtualFiles final vs original fileStates
+  const allPaths = new Set<string>();
+  for (const p of fileStates.keys()) allPaths.add(p);
+  for (const p of virtualFiles.keys()) allPaths.add(p);
+
+  const outputLines: Array<{ sortKey: string; line: string }> = [];
+
+  // Handle moves explicitly
+  const handledPaths = new Set<string>();
+  for (const m of moves) {
+    const oldP = m.oldPath!;
+    const newP = m.newPath!;
+    handledPaths.add(oldP);
+    handledPaths.add(newP);
+    outputLines.push({ sortKey: newP, line: `R ${oldP} -> ${newP}` });
+  }
+
+  for (const [p, v] of virtualFiles.entries()) {
+    if (handledPaths.has(p)) continue;
+    const orig = fileStates.get(p);
+    const origExists = orig ? orig.exists : false;
+    const origContent = orig ? (orig.content ?? '') : '';
+
+    let newContent = '';
+    if (v.exists) {
+      if (v.raw !== undefined && !v.lines) {
+        newContent = v.raw;
+      } else if (v.lines) {
+        newContent = serializeFileContent(v.lines);
+      }
+    }
+
+    if (!origExists && v.exists) {
+      outputLines.push({ sortKey: p, line: `A ${p}` });
+    } else if (origExists && !v.exists) {
+      outputLines.push({ sortKey: p, line: `D ${p}` });
+    } else if (origExists && v.exists) {
+      if (origContent !== newContent) {
+        outputLines.push({ sortKey: p, line: `M ${p}` });
+      }
+    }
+  }
+
+  // Sort output lines by path (UTF-8 byte order of paths)
+  outputLines.sort((a, b) => (a.sortKey < b.sortKey ? -1 : a.sortKey > b.sortKey ? 1 : 0));
+
+  if (!check) {
+    // Perform actual disk writes
+    for (const [p, v] of virtualFiles.entries()) {
+      const orig = fileStates.get(p);
+      const origExists = orig ? orig.exists : false;
+      const origContent = orig ? (orig.content ?? '') : '';
+
+      let newContent = '';
+      if (v.exists) {
+        if (v.raw !== undefined && !v.lines) {
+          newContent = v.raw;
+        } else if (v.lines) {
+          newContent = serializeFileContent(v.lines);
+        }
+      }
+
+      if (!v.exists) {
+        if (origExists && fs.existsSync(p)) {
+          fs.unlinkSync(p);
+        }
+      } else {
+        // Ensure parent directories exist
+        const dir = path.dirname(p);
+        if (dir && dir !== '.' && !fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+        fs.writeFileSync(p, newContent, 'utf8');
+      }
+    }
+
+    // Handle delete for old paths in moves if any
+    for (const m of moves) {
+      if (fs.existsSync(m.oldPath!)) {
+        fs.unlinkSync(m.oldPath!);
+      }
+    }
+  }
+
+  for (const ol of outputLines) {
+    process.stdout.write(ol.line + '\n');
+  }
+
+  const nFiles = outputLines.length;
+  if (nFiles === 1) {
+    process.stdout.write('ok: 1 file\n');
+  } else {
+    process.stdout.write(`ok: ${nFiles} files\n`);
+  }
+  process.exit(0);
+}
+
+main();
