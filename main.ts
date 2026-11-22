@@ -394,7 +394,7 @@ function parseV4A(text: string): ParseResult {
   }
 
   if (lastNonBlankText !== "*** End Patch") {
-    const errLine = lastNonBlankIdx === -1 ? lines.length + 1 : lastNonBlankIdx + 1;
+    const patchLineCount = text.endsWith("\n") ? lines.length - 1 : lines.length; const errLine = patchLineCount + 1;
     return { edits: [], error: { code: "parse", line: errLine } };
   }
 
@@ -491,7 +491,7 @@ function parseV4A(text: string): ParseResult {
         return { edits: [], error: { code: "parse", line: updateLineNum } };
       }
 
-      const chunks: Array<{ anchor: string | null; oldLines: string[]; newLines: string[]; endOfFile: boolean }> = [];
+      const chunks: Array<{ anchor: string | null; oldLines: string[]; newLines: string[]; endOfFile: boolean; isContext: boolean[]; oIndex: number[] }> = [];
       let ci = chunkStartIdx;
 
       while (ci < trimmedSecLines.length) {
@@ -506,6 +506,8 @@ function parseV4A(text: string): ParseResult {
         }
 
         const oldLines: string[] = [];
+        const isContext: boolean[] = [];
+        const oIndex: number[] = [];
         const newLines: string[] = [];
         let endOfFile = false;
         let hasChunkContent = false;
@@ -529,6 +531,8 @@ function parseV4A(text: string): ParseResult {
             const body = l.slice(1);
             oldLines.push(body);
             newLines.push(body);
+            isContext.push(true);
+            oIndex.push(oldLines.length - 1);
             hasChunkContent = true;
             ci++;
           } else if (l.startsWith("-")) {
@@ -539,23 +543,27 @@ function parseV4A(text: string): ParseResult {
           } else if (l.startsWith("+")) {
             const body = l.slice(1);
             newLines.push(body);
+            isContext.push(false);
+            oIndex.push(-1);
             hasChunkContent = true;
             ci++;
           } else if (l === "") {
             oldLines.push("");
             newLines.push("");
+            isContext.push(true);
+            oIndex.push(oldLines.length - 1);
             hasChunkContent = true;
             ci++;
           } else {
             return { edits: [], error: { code: "parse", line: item.num } };
           }
         }
-
+        
         if (!hasChunkContent) {
           return { edits: [], error: { code: "parse", line: firstItem.num } };
         }
 
-        chunks.push({ anchor, oldLines, newLines, endOfFile });
+        chunks.push({ anchor, oldLines, newLines, endOfFile, isContext, oIndex });;
       }
 
       edits.push({
@@ -806,7 +814,7 @@ function applyUnifiedHunks(fileLines: FileLines, hunks: any[], strict: boolean):
   return { success: true, lines };
 }
 
-function applyV4AUpdate(fileLines: FileLines, chunks: Array<{ anchor: string | null; oldLines: string[]; newLines: string[]; endOfFile: boolean }>, strict: boolean): { success: boolean; lines?: string[]; error?: { code: string } } {
+function applyV4AUpdate(fileLines: FileLines, chunks: Array<{ anchor: string | null; oldLines: string[]; newLines: string[]; endOfFile: boolean; isContext: boolean[]; oIndex: number[] }>, strict: boolean): { success: boolean; lines?: string[]; error?: { code: string } } {
   let lines = [...fileLines.lines];
   let cursor = 0;
 
@@ -897,17 +905,20 @@ function applyV4AUpdate(fileLines: FileLines, chunks: Array<{ anchor: string | n
       return { success: false, error: { code: "no-match" } };
     }
 
-    let finalN = N;
-    if (targetTier === 2 && O.length > 0) {
-      const fileIndent = getIndent(lines[targetIdx]);
-      const searchIndent = getIndent(O[0]);
-      if (fileIndent !== searchIndent) {
-        finalN = N.map((rLine) => {
-          if (rLine.trim() === "") return rLine;
-          const stripped = stripIndent(rLine);
-          return fileIndent + stripped;
-        });
-      }
+    let finalN = [];
+    const fileIndent = targetTier === 2 ? getIndent(lines[targetIdx]) : "";
+    const searchIndent = targetTier === 2 ? getIndent(O[0]) : "";
+    
+    for (let i = 0; i < N.length; i++) {
+        if (chunk.isContext[i]) {
+            finalN.push(lines[targetIdx + chunk.oIndex[i]]);
+        } else {
+            let line = N[i];
+            if (targetTier === 2 && line.trim() !== "" && searchIndent !== "" && line.startsWith(searchIndent)) {
+                line = fileIndent + line.slice(searchIndent.length);
+            }
+            finalN.push(line);
+        }
     }
 
     lines.splice(targetIdx, O.length, ...finalN);
@@ -1129,6 +1140,10 @@ function main() {
         plannedChanges.push({ type: 'M', path: edit.path });
       } else if (edit.chunks) {
         // v4a
+        if (edit.newPath && getVirtualFile(edit.newPath).exists) {
+          errorLines.push(`error: exists ${edit.newPath}`);
+          continue;
+        }
         if (!v.lines && v.raw !== undefined) {
           v.lines = parseFileContent(v.raw);
         }
@@ -1142,7 +1157,13 @@ function main() {
           crlf: v.lines?.crlf ?? false,
           hasEndingNewline: v.lines?.hasEndingNewline ?? true
         };
-        plannedChanges.push({ type: "M", path: edit.path });
+        if (edit.newPath) {
+          virtualFiles.set(edit.path, { exists: false });
+          virtualFiles.set(edit.newPath, v);
+          plannedChanges.push({ type: "R", path: edit.newPath, oldPath: edit.path, newPath: edit.newPath });
+        } else {
+          plannedChanges.push({ type: "M", path: edit.path });
+        }
       } else {
         // search-replace
         if (!v.lines && v.raw !== undefined) {
