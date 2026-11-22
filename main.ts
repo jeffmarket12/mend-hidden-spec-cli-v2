@@ -315,28 +315,27 @@ function parseSearchReplace(text: string): ParseResult {
       if (!targetPath) {
         return { edits: [], error: { code: 'parse', line: i + 1 } };
       }
+      const searchLineNumber = i + 1;
       lastPath = targetPath;
       i++;
 
       const searchLines: string[] = [];
-      let searchStart = i + 1;
       while (i < lines.length && lines[i].trim() !== '=======') {
         searchLines.push(lines[i]);
         i++;
       }
       if (i >= lines.length) {
-        return { edits: [], error: { code: 'parse', line: searchStart } };
+        return { edits: [], error: { code: 'parse', line: searchLineNumber } };
       }
       i++; // skip =======
 
       const replaceLines: string[] = [];
-      let replaceStart = i + 1;
       while (i < lines.length && !lines[i].trim().startsWith('>>>>>>>')) {
         replaceLines.push(lines[i]);
         i++;
       }
       if (i >= lines.length) {
-        return { edits: [], error: { code: 'parse', line: replaceStart } };
+        return { edits: [], error: { code: 'parse', line: searchLineNumber } };
       }
       const endLine = lines[i];
       const endMatch = endLine.trim().match(/^>>>>>>>(?:\s+REPLACE)?(?:\s+(.+))?$/);
