@@ -149,7 +149,8 @@ function detectFormat(text: string): PatchFormat | null {
     }
   }
   for (const line of lines) {
-    if (line.startsWith('=== file:') || line.startsWith('=== create:') || line.startsWith('=== delete:') || line.startsWith('=== move:')) {
+    const t = line.trim();
+    if (t === '*** Begin Patch' || t.startsWith('*** Add File:') || t.startsWith('*** Update File:') || t.startsWith('*** Delete File:') || t.startsWith('*** Move to:') || line.startsWith('=== file:') || line.startsWith('=== create:') || line.startsWith('=== delete:') || line.startsWith('=== move:')) {
       return 'v4a';
     }
   }
